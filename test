@@ -1,257 +1,69 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-
     <modelVersion>4.0.0</modelVersion>
 
+    <!-- Upgraded Spring Boot Parent -->
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
         <version>4.1.0</version>
-        <relativePath/>
+        <relativePath/> <!-- lookup parent from repository -->
     </parent>
 
     <groupId>com.fincore</groupId>
-    <artifactId>LoginService</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>Login-service</name>
+    <artifactId>EnquiryService</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+    <name>enquiry-service</name>
+    <description>Service to view all the enquiries</description>
 
     <properties>
         <java.version>21</java.version>
-
-        <!-- Existing project properties -->
-        <spring-cloud.version>2025.0.0</spring-cloud.version>
-        <jjwt.version>0.12.6</jjwt.version>
-        <netty.version>4.2.18.Final</netty.version>
-        <kafka.version>4.1.2</kafka.version>
-        <lz4.version>1.8.1</lz4.version>
-
-        <!-- Framework overrides from the original POM -->
-        <spring-framework.version>7.0.9</spring-framework.version>
-        <spring-security.version>7.1.1</spring-security.version>
-
-        <!-- Jackson security updates -->
-        <jackson.version>2.22.4</jackson.version>
-        <tools.jackson.version>3.2.4</tools.jackson.version>
-
-        <!-- Other original overrides -->
-        <micrometer.version>1.16.6</micrometer.version>
-
-        <!-- SCA remediation overrides -->
-        <tomcat.version>11.0.27</tomcat.version>
-        <snappy.version>1.1.10.12</snappy.version>
-        <yawk.lz4.version>1.12.1</yawk.lz4.version>
-        <zstd.version>1.5.7-17</zstd.version>
-        <log4j.version>2.26.1</log4j.version>
+        <!-- Security Fix: Override transitive Tomcat version to 11.0.26 -->
+        <tomcat.version>11.0.26</tomcat.version>
+        <!-- Security Fix: Define Log4j version property -->
+        <log4j2.version>2.25.4</log4j2.version>
+        <!-- SECURITY FIX: Upgraded Netty to resolve netty-handler high-severity vulnerability -->
+        <netty.version>4.2.17.Final</netty.version>
     </properties>
 
+    <!-- Security Fix: Enforce spring-webmvc version 7.0.9 to resolve CVE-2026-59313 -->
     <dependencyManagement>
         <dependencies>
-
-            <!-- Spring Cloud BOM -->
-            <dependency>
-                <groupId>org.springframework.cloud</groupId>
-                <artifactId>spring-cloud-dependencies</artifactId>
-                <version>${spring-cloud.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-
-            <!-- Netty BOM -->
-            <dependency>
-                <groupId>io.netty</groupId>
-                <artifactId>netty-bom</artifactId>
-                <version>${netty.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-
-            <!-- Jackson 2.x BOM -->
-            <dependency>
+            <!-- <dependency>
                 <groupId>com.fasterxml.jackson</groupId>
                 <artifactId>jackson-bom</artifactId>
-                <version>${jackson.version}</version>
-                <type>pom</type>
+                <version>2.22.3</version>
                 <scope>import</scope>
-            </dependency>
-
-            <!-- Jackson 3.x BOM -->
-            <dependency>
-                <groupId>tools.jackson</groupId>
-                <artifactId>jackson-bom</artifactId>
-                <version>${tools.jackson.version}</version>
                 <type>pom</type>
-                <scope>import</scope>
-            </dependency>
+            </dependency> -->
 
-            <!-- Tomcat Embed Core -->
             <dependency>
-                <groupId>org.apache.tomcat.embed</groupId>
-                <artifactId>tomcat-embed-core</artifactId>
-                <version>${tomcat.version}</version>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-webmvc</artifactId>
+                <version>7.0.9</version>
             </dependency>
-
-            <!-- Kafka clients -->
-            <dependency>
-                <groupId>org.apache.kafka</groupId>
-                <artifactId>kafka-clients</artifactId>
-                <version>${kafka.version}</version>
-            </dependency>
-
-            <!-- Existing LZ4 dependency -->
-            <dependency>
-                <groupId>org.lz4</groupId>
-                <artifactId>lz4-java</artifactId>
-                <version>${lz4.version}</version>
-            </dependency>
-
-            <!-- Separate coordinate reported by SCA -->
-            <dependency>
-                <groupId>at.yawk.lz4</groupId>
-                <artifactId>lz4-java</artifactId>
-                <version>${yawk.lz4.version}</version>
-            </dependency>
-
-            <!-- Snappy Java -->
-            <dependency>
-                <groupId>org.xerial.snappy</groupId>
-                <artifactId>snappy-java</artifactId>
-                <version>${snappy.version}</version>
-            </dependency>
-
-            <!-- Zstandard JNI -->
-            <dependency>
-                <groupId>com.github.luben</groupId>
-                <artifactId>zstd-jni</artifactId>
-                <version>${zstd.version}</version>
-            </dependency>
-
-            <!-- Log4j API -->
-            <dependency>
-                <groupId>org.apache.logging.log4j</groupId>
-                <artifactId>log4j-api</artifactId>
-                <version>${log4j.version}</version>
-            </dependency>
-
-            <!-- Keep Core aligned if it is used -->
-            <dependency>
-                <groupId>org.apache.logging.log4j</groupId>
-                <artifactId>log4j-core</artifactId>
-                <version>${log4j.version}</version>
-            </dependency>
-
-            <!-- Micrometer Core -->
-            <dependency>
-                <groupId>io.micrometer</groupId>
-                <artifactId>micrometer-core</artifactId>
-                <version>${micrometer.version}</version>
-            </dependency>
-
         </dependencies>
     </dependencyManagement>
 
     <dependencies>
-
-        <!-- Web and Reactive -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webflux</artifactId>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-core</artifactId>
+            <version>${tomcat.version}</version>
         </dependency>
 
-        <!-- Security and OAuth2 -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-security</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
-        </dependency>
-
-        <!-- Data and Persistence -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-ldap</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>com.oracle.database.jdbc</groupId>
-            <artifactId>ojdbc11</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-
-        <!-- JWT -->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>${jjwt.version}</version>
-        </dependency>
-
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
-
-        <!-- Validation -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
-        <!-- Messaging and Kafka -->
-        <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-messaging</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-kafka</artifactId>
-        </dependency>
-
-        <!-- Observability -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-registry-prometheus</artifactId>
-        </dependency>
-
-        <!-- Utilities -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -259,43 +71,139 @@
         </dependency>
 
         <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-pool2</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
 
-        <!-- Internal library: verify the version in your original POM -->
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc11</artifactId>
+        </dependency>
+        
+        <!-- Security Fix: Explicitly define jackson-core and update jackson-databind to 2.22.3 -->
+        <!-- <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>2.18.11</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.18.11</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>2.18.11</version>
+        </dependency> -->
+
+        <!-- Security Fix: Explicitly define tools jackson-core and update jackson-databind to 3.2.3 -->
+        <!-- <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>3.2.3</version>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>3.2.3</version>
+        </dependency> -->
+
+        <!-- Internal Dependency with POI Exclusions -->
         <dependency>
             <groupId>com.fincore</groupId>
             <artifactId>common-utilities</artifactId>
-            <version>1.0.0</version>
+            <version>2.0.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.poi</groupId>
+                    <artifactId>poi</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.poi</groupId>
+                    <artifactId>poi-ooxml</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.poi</groupId>
+                    <artifactId>poi-ooxml-schemas</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
-        <!-- Jakarta SOAP -->
+        <!-- Apache POI -->
         <dependency>
-            <groupId>com.sun.xml.messaging.saaj</groupId>
-            <artifactId>saaj-impl</artifactId>
-            <version>3.0.3</version>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi</artifactId>
+            <version>5.2.5</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.2.5</version>
         </dependency>
 
-        <!-- Testing -->
+        <!-- Security Fix: Upgraded Log4j to 2.25.4 -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+            <version>${log4j2.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j2.version}</version>
+        </dependency>
+
+        <!-- health metrics -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
+            <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
         <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka-test</artifactId>
-            <scope>test</scope>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+            <version>7.4</version>
+        </dependency>
+
+        <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-restclient</artifactId>
+</dependency>   
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-restclient</artifactId>
         </dependency>
 
     </dependencies>
 
     <build>
         <finalName>${project.artifactId}</finalName>
-
         <plugins>
+            <!-- maven-compiler-plugin with Lombok Annotation Processor -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <!-- Spring Boot Maven Plugin excluding Lombok from fat jar -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
@@ -310,5 +218,61 @@
             </plugin>
         </plugins>
     </build>
-
 </project>
+
+
+Security Violations
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE             | SEVERITY   | DIRECT                    | DIRECT  | AFFECTED                  | AFFECTED  | FIXED     | TYPE  |
+|                 |            | PACKAGE                   | PACKAGE | COMPONENT                 | COMPONENT | VERSIONS  |       |
+|                 |            |                           | VERSION | NAME                      | VERSION   |           |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-110879 | Critical | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.12] | Maven |
+|                 |            | e:jackson-databind        |         | e:jackson-databind        |           | [2.21.8]  |       |
+|                 |            |                           |         |                           |           | [2.22.4]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-110879 | Critical | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.8]   | Maven |
+|                 |            | n-databind                |         | n-databind                |           | [3.2.4]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-89407  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.11] | Maven |
+|                 |            | e:jackson-core            |         | e:jackson-core            |           | [2.21.7]  |       |
+|                 |            |                           |         |                           |           | [2.22.3]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-89407  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.7]   | Maven |
+|                 |            | n-core                    |         | n-core                    |           | [3.2.2]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-91776  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.11] | Maven |
+|                 |            | e:jackson-databind        |         | e:jackson-databind        |           | [2.21.7]  |       |
+|                 |            |                           |         |                           |           | [2.22.3]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-91776  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.7]   | Maven |
+|                 |            | n-databind                |         | n-databind                |           | [3.2.3]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-91777  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.11] | Maven |
+|                 |            | e:jackson-databind        |         | e:jackson-databind        |           | [2.21.7]  |       |
+|                 |            |                           |         |                           |           | [2.22.3]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-91777  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.7]   | Maven |
+|                 |            | n-databind                |         | n-databind                |           | [3.2.3]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-89425  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.7]   | Maven |
+|                 |            | n-core                    |         | n-core                    |           | [3.2.3]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-89425  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.11] | Maven |
+|                 |            | e:jackson-core            |         | e:jackson-core            |           | [2.21.7]  |       |
+|                 |            |                           |         |                           |           | [2.22.3]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-68498  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.6]   | Maven |
+|                 |            | n-core                    |         | n-core                    |           | [3.2.2]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-68498  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.10] | Maven |
+|                 |            | e:jackson-core            |         | e:jackson-core            |           | [2.21.6]  |       |
+|                 |            |                           |         |                           |           | [2.22.2]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-68497  | High     | tools.jackson.core:jackso | 3.1.4   | tools.jackson.core:jackso | 3.1.4     | [3.1.6]   | Maven |
+|                 |            | n-databind                |         | n-databind                |           | [3.2.2]   |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
+| CVE-2026-68497  | High     | com.fasterxml.jackson.cor | 2.21.4  | com.fasterxml.jackson.cor | 2.21.4    | [2.18.10] | Maven |
+|                 |            | e:jackson-databind        |         | e:jackson-databind        |           | [2.21.6]  |       |
+|                 |            |                           |         |                           |           | [2.22.2]  |       |
++-----------------+------------+---------------------------+---------+---------------------------+-----------+-----------+-------+
