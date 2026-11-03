@@ -1,40 +1,60 @@
-// src/context/AuthContext.jsx
-import { clearMenus } from "../store/slices/menuSlice"; // <-- Add this import
-import { persistor } from "../store/store";             // <-- Add this import
-// ... other imports
+Frontend change review : 
 
-export const AuthProvider = ({ children }) => {
-  // ... existing state and refs ...
+1. Handling the Initial Login Response (`POST /api/auth/login`)
+When a user submits valid credentials, the backend will now return one of two states:
 
-  const performLogout = useCallback(
-    async (reason = "USER_INITIATED") => {
-      clearAllTimers();
-      setSessionReason(reason);
-      setSessionDialogOpen(true);
+*   If MFA is Disabled (`200 OK`): Standard login success. Read the `accessToken` from the body, the `X-Payload-Key` from the headers, and proceed to the dashboard.
+*   If MFA is Enabled (`202 ACCEPTED`): The response body contains the `OtpInitiatedResponseDTO`. You must capture the `transactionId` and store it in your state/session storage, then route the user to the OTP Entry Screen.
 
-      try {
-        await api.post(`${resolveConfig("/LS")}/auth/logout`);
-      } catch (e) {
-        console.error(e);
-      } finally {
-        // 1. Clear menus
-        dispatch(clearMenus());
-        
-        // 2. Clear auth state
-        dispatch(logoutSuccess());
-        
-        // 3. Purge storage BEFORE navigating to the login screen
-        try {
-          await persistor.purge();
-        } catch (error) {
-          console.error("Error while purging persisted store:", error);
-        }
-        
-        setWarningOpen(false);
-      }
-    },
-    [dispatch, clearAllTimers]
-  );
+Payload Structure (`202 Accepted`):
+{
+  "success": true,
+  "message": "Code sent to ***1234 and a***o@sbi.co.in",
+  "data": {
+    "transactionId": "uuid-tx-string",
+    "maskedMobile": "***1234",
+    "maskedEmail": "a***o@sbi.co.in",
+    "expiresInSeconds": 300,
+    "resendCooldownSeconds": 60,
+    "resendsRemaining": 3,
+    "message": "Code sent to ***1234 and a***o@sbi.co.in"
+  }
+}
 
-  // ... rest of the context provider
-};
+
+Action: Display the exact message string returned by the backend on the UI (e.g., "Code sent to 1234 and ao@sbi.co.in").
+
+2. Implementing the OTP Screen UI Constraints
+
+A. Code Input Validation
+ * The input field must restrict users to numeric characters only.
+ * It must be exactly 6 digits before the "Verify" button is enabled.
+ * Validation Error: If invalid, the backend will return 400 Bad Request with the message: "Please enter a valid 6-digit numeric code.".
+
+B. The 60-Second Resend Cooldown
+ * When the user clicks "Resend Code", start a strict 60-second visual countdown timer on the resend button.
+ * If the user somehow bypasses the UI and clicks it early, the backend will reject it with 429 Too Many Requests and return: "Please wait {N} seconds before requesting another code." (where {N} is the exact remaining seconds fetched from Redis).
+
+C. Maximum Resend Limit
+ * The system allows a maximum of 3 resends within a 10-minute window.
+ * Decrement the resendsRemaining count on the UI with every successful resend.
+ * If exhausted, the backend returns 429 Too Many Requests: "Maximum resend limit reached. Kindly Wait.".
+
+D. The 15-Minute Idle Timeout
+ * The overall OTP screen session lasts for 15 minutes.
+ * If the user sits idle for 15 minutes, their next action will return 401 Unauthorized with the message: "Your session has timed out. Please log in again.".
+ * Frontend Action: Automatically pop up a modal and redirect them back to the login screen.
+
+3. Handling OTP Verification Responses (POST /api/auth/verify-otp)
+Send the { transactionId, otp } payload.
+ 
+* Success (200 OK): Returns the standard login success response with tokens and user data. Proceed to dashboard.
+
+ * Wrong Code (Attempts 1–4): Returns 401 Unauthorized.
+   * Message example: "Invalid code. 3 attempts remaining."
+   * Frontend Action: Display this exact message dynamically and clear the OTP input field for the next try.
+ * 5th Failed Attempt: Returns 401 Unauthorized.
+   * Message: "Too many incorrect attempts. The code has been expired. Please request a new code."
+   * Frontend Action: Disable the OTP input box and force the user to click the Resend Code button to get a fresh code.
+ * Code Expired (> 5 mins): Returns 401 Unauthorized.
+   * Message: "The code is invalid or has expired. Please request a new code."
