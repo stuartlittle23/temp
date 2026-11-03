@@ -1,1616 +1,1377 @@
-package com.fincore.enquiry_service.service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.enquiry_service.dto.LedgerWiseBalanceRequest;
-import com.fincore.enquiry_service.dto.MyDownloadsRequestDTO;
-import com.fincore.enquiry_service.dto.SearchCriteriaDTO;
-import com.fincore.enquiry_service.enums.ReportType;
-import com.fincore.enquiry_service.exception.ExportLimitException;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.ss.util.CellRangeAddress;
-import org.apache.poi.xssf.streaming.SXSSFSheet;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.sql.PreparedStatement;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class LedgerWiseBalanceExportService {
-
-        private static final String FOREIGN_CIRCLE = "021";
-
-        private static final long MAX_EXPORT_LIMIT = 1_000_000L;
-
-        private static final int FETCH_SIZE = 20_000;
-
-        private final JdbcTemplate jdbcTemplate;
-
-        private final MyDownloadsService myDownloadsService;
-
-        public byte[] export(
-                        LedgerWiseBalanceRequest dto,
-                        String userId) {
-
-                if (dto.getEnquiryType() == ReportType.CONSOLIDATED) {
-                        return exportConsolidated(dto, userId);
-                }
-
-                return exportCollation(dto, userId);
-        }
-
-        private byte[] exportCollation(
-                        LedgerWiseBalanceRequest dto,
-                        String userId) {
-
-                validateCollationLimit(dto);
-
-                try {
-
-                        StringBuilder sql = new StringBuilder("""
-                                        SELECT
-                                            g.ID,
-                                            g.BALANCE_DATE,
-
-                                            b.CODE BRANCH_CODE,
-                                            b.NAME BRANCH_NAME,
-
-                                            c.CIRCLE_CODE,
-                                            c.CIRCLE_NAME,
-
-                                            g.CURRENCY,
-                                            cu.CURRENCY_NAME,
-
-                                            g.CGL,
-                                            cg.DESCRIPTION,
-
-                                            g.BALANCE,
-                                            g.INR_BALANCE
-
-                                        FROM GL_BALANCE g
-
-                                        JOIN BRANCH_MASTER b
-                                            ON g.BRANCH_CODE = b.CODE
-
-                                        LEFT JOIN CIRCLE_MASTER c
-                                            ON b.CIRCLE_CODE = c.CIRCLE_CODE
-
-                                        LEFT JOIN CURRENCY_MASTER cu
-                                            ON cu.CURRENCY_CODE = g.CURRENCY
-
-                                        LEFT JOIN CGL_MASTER cg
-                                            ON cg.CGL_NUMBER = g.CGL
-
-                                        WHERE 1 = 1
-                                        """);
-
-                        List<Object> params = new ArrayList<>();
-
-                        sql.append("""
-                                        AND g.BALANCE_DATE =
-                                            TO_DATE(?,'DD/MM/YYYY')
-                                        """);
-
-                        params.add(dto.getBalanceDate());
-
-                        if (!dto.getCgls().contains("ALL")) {
-
-                                sql.append(" AND g.CGL IN (");
-
-                                sql.append(dto.getCgls()
-                                                .stream()
-                                                .map(v -> "?")
-                                                .collect(Collectors.joining(",")));
-
-                                sql.append(")");
-
-                                params.addAll(dto.getCgls());
-                        }
-
-                        // Currency
-                        if (!dto.getCurrencies().contains("ALL")) {
-
-                                sql.append(" AND g.CURRENCY IN (");
-
-                                sql.append(dto.getCurrencies()
-                                                .stream()
-                                                .map(v -> "?")
-                                                .collect(Collectors.joining(",")));
-
-                                sql.append(")");
-
-                                params.addAll(dto.getCurrencies().stream().map(String::trim).toList());
-                        }
-
-                        // Circle
-
-                        if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append(" AND c.CIRCLE_CODE <> ? ");
-
-                                params.add(FOREIGN_CIRCLE);
-
-                        } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append(" AND c.CIRCLE_CODE = ? ");
-
-                                params.add(FOREIGN_CIRCLE);
-
-                        } else if (!"ALL".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append(" AND c.CIRCLE_CODE = ? ");
-
-                                params.add(dto.getCircle());
-                        }
-
-                        // Branch
-
-                        if (dto.getBranches() != null
-                                        && !dto.getBranches().contains("ALL")
-                                        && !dto.getBranches().isEmpty()) {
-
-                                sql.append(" AND g.BRANCH_CODE IN (");
-
-                                sql.append(dto.getBranches()
-                                                .stream()
-                                                .map(v -> "?")
-                                                .collect(Collectors.joining(",")));
-
-                                sql.append(")");
-
-                                params.addAll(dto.getBranches());
-                        }
-
-                        // Only Non Zero
-
-                        sql.append("""
-                                        AND (
-                                            NVL(g.BALANCE,0) <> 0
-                                            OR NVL(g.INR_BALANCE,0) <> 0
-                                        )
-                                        """);
-
-                        sql.append("""
-                                        ORDER BY
-                                            cg.CGL_NUMBER
-                                        """);
-
-                        log.info("Collation Export Started");
-
-                        long start = System.currentTimeMillis();
-
-                        try (SXSSFWorkbook workbook = new SXSSFWorkbook(1000);
-                                        ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-
-                                workbook.setCompressTempFiles(true);
-
-                                SXSSFSheet sheet = workbook.createSheet("Collation");
-
-                                createCollationHeader(
-                                                workbook,
-                                                sheet,
-                                                dto);
-
-                                AtomicInteger rowNum = new AtomicInteger(4);
-
-                                jdbcTemplate.setFetchSize(FETCH_SIZE);
-
-                                jdbcTemplate.query(connection -> {
-
-                                        PreparedStatement ps = connection.prepareStatement(sql.toString());
-
-                                        ps.setFetchSize(FETCH_SIZE);
-
-                                        for (int i = 0; i < params.size(); i++) {
-                                                ps.setObject(i + 1, params.get(i));
-                                        }
-
-                                        return ps;
-
-                                }, rs -> {
-
-                                        Row row = sheet.createRow(rowNum.getAndIncrement());
-
-                                        int col = 0;
-
-                                        row.createCell(col++)
-                                                        .setCellValue(rs.getLong("ID"));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("BALANCE_DATE")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CIRCLE_CODE")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CIRCLE_NAME")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("BRANCH_CODE")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("BRANCH_NAME")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CURRENCY")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CURRENCY_NAME")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CGL")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("DESCRIPTION")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(
-                                                                        rs.getBigDecimal("BALANCE") == null
-                                                                                        ? 0
-                                                                                        : rs.getBigDecimal("BALANCE")
-                                                                                                        .doubleValue());
-
-                                        row.createCell(col++)
-                                                        .setCellValue(
-                                                                        rs.getBigDecimal("INR_BALANCE") == null
-                                                                                        ? 0
-                                                                                        : rs.getBigDecimal(
-                                                                                                        "INR_BALANCE")
-                                                                                                        .doubleValue());
-
-                                        if (rowNum.get() % 5000 == 0) {
-
-                                                try {
-                                                        sheet.flushRows(500);
-                                                } catch (IOException e) {
-                                                        throw new RuntimeException(e);
-                                                }
-
-                                                log.info(
-                                                                "Processed {} rows",
-                                                                rowNum.get());
-                                        }
-
-                                });
-
-                                sheet.flushRows();
-
-                                setColumnWidths(sheet);
-
-                                workbook.write(out);
-
-                                byte[] bytes = out.toByteArray();
-
-                                workbook.dispose();
-
-                                SearchCriteriaDTO search = new SearchCriteriaDTO();
-
-                                search.setCircle(dto.getCircle());
-                                search.setBranch(String.join(", ", dto.getBranches()));
-                                search.setCurrency(String.join(", ", dto.getCurrencies()));
-                                search.setCgl(String.join(", ", dto.getCgls()));
-                                search.setBalanceDate(dto.getBalanceDate());
-
-                                sendToMyDownloads(
-                                                userId,
-                                                dto,
-                                                search,
-                                                bytes);
-
-                                log.info(
-                                                "Collation Export Completed in {} sec",
-                                                (System.currentTimeMillis() - start) / 1000);
-
-                                return bytes;
-                        }
-
-                } catch (IOException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Collation Export Failed due to an IO exception.");
-                        throw new RuntimeException("Failed to generate Excel", e);
-                } catch (DataAccessException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Database error occurred during collation export.");
-                        throw new RuntimeException("Database error during export", e);
-                }
-        }
-
-        private byte[] exportConsolidated(
-                        LedgerWiseBalanceRequest dto,
-                        String userId) {
-
-                validateConsolidatedLimit(dto);
-
-                try {
-
-                        StringBuilder sql = new StringBuilder("""
-                                        SELECT
-                                            MIN(g.ID) ID,
-                                            g.CGL,
-                                            cg.DESCRIPTION,
-                                            g.CURRENCY,
-                                            cu.CURRENCY_NAME,
-                                            SUM(g.BALANCE) BALANCE,
-                                            SUM(g.INR_BALANCE) INR_BALANCE
-
-                                        FROM GL_BALANCE g
-
-                                        JOIN BRANCH_MASTER b
-                                            ON g.BRANCH_CODE = b.CODE
-
-                                        LEFT JOIN CGL_MASTER cg
-                                            ON cg.CGL_NUMBER = g.CGL
-
-                                        LEFT JOIN CURRENCY_MASTER cu
-                                            ON cu.CURRENCY_CODE = g.CURRENCY
-
-                                        WHERE 1 = 1
-                                        """);
-
-                        List<Object> params = new ArrayList<>();
-
-                        // Balance Date
-                        sql.append("""
-                                        AND g.BALANCE_DATE =
-                                            TO_DATE(?,'DD/MM/YYYY')
-                                        """);
-
-                        params.add(dto.getBalanceDate());
-
-                        // Circle
-                        if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append("""
-                                                AND b.CIRCLE_CODE <> ?
-                                                """);
-
-                                params.add(FOREIGN_CIRCLE);
-
-                        } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append("""
-                                                AND b.CIRCLE_CODE = ?
-                                                """);
-
-                                params.add(FOREIGN_CIRCLE);
-
-                        } else if (!"ALL".equalsIgnoreCase(dto.getCircle())) {
-
-                                sql.append("""
-                                                AND b.CIRCLE_CODE = ?
-                                                """);
-
-                                params.add(dto.getCircle());
-                        }
-
-                        // Currency
-
-                        if (!dto.getCurrencies().contains("ALL")) {
-
-                                sql.append(" AND g.CURRENCY IN (");
-
-                                sql.append(dto.getCurrencies()
-                                                .stream()
-                                                .map(v -> "?")
-                                                .collect(Collectors.joining(",")));
-
-                                sql.append(")");
-
-                                params.addAll(dto.getCurrencies().stream().map(String::trim).toList());
-                        }
-
-                        // CGL
-
-                        if (!dto.getCgls().contains("ALL")) {
-
-                                sql.append(" AND g.CGL IN (");
-
-                                sql.append(dto.getCgls()
-                                                .stream()
-                                                .map(v -> "?")
-                                                .collect(Collectors.joining(",")));
-
-                                sql.append(")");
-
-                                params.addAll(dto.getCgls());
-                        }
-
-                        sql.append("""
-
-                                        GROUP BY
-                                            g.CGL,
-                                            cg.DESCRIPTION,
-                                            g.CURRENCY,
-                                            cu.CURRENCY_NAME
-
-                                        HAVING
-                                            SUM(g.BALANCE) <> 0
-                                            OR SUM(g.INR_BALANCE) <> 0
-
-                                        ORDER BY
-                                            g.CGL
-
-                                        """);
-
-                        log.info("Consolidated Export Started");
-
-                        long start = System.currentTimeMillis();
-
-                        try (SXSSFWorkbook workbook = new SXSSFWorkbook(1000);
-                                        ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-
-                                workbook.setCompressTempFiles(true);
-
-                                SXSSFSheet sheet = workbook.createSheet("Consolidated");
-
-                                createConsolidatedHeader(
-                                                workbook,
-                                                sheet,
-                                                dto);
-
-                                AtomicInteger rowNum = new AtomicInteger(4);
-
-                                jdbcTemplate.setFetchSize(FETCH_SIZE);
-
-                                jdbcTemplate.query(connection -> {
-
-                                        PreparedStatement ps = connection.prepareStatement(sql.toString());
-
-                                        ps.setFetchSize(FETCH_SIZE);
-
-                                        for (int i = 0; i < params.size(); i++) {
-
-                                                ps.setObject(i + 1, params.get(i));
-                                        }
-
-                                        return ps;
-
-                                }, rs -> {
-
-                                        Row row = sheet.createRow(rowNum.getAndIncrement());
-
-                                        int col = 0;
-
-                                        row.createCell(col++)
-                                                        .setCellValue(rs.getLong("ID"));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CGL")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("DESCRIPTION")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CURRENCY")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(safeString(rs.getString("CURRENCY_NAME")));
-
-                                        row.createCell(col++)
-                                                        .setCellValue(
-                                                                        rs.getBigDecimal("BALANCE") == null
-                                                                                        ? 0
-                                                                                        : rs.getBigDecimal("BALANCE")
-                                                                                                        .doubleValue());
-
-                                        row.createCell(col++)
-                                                        .setCellValue(
-                                                                        rs.getBigDecimal("INR_BALANCE") == null
-                                                                                        ? 0
-                                                                                        : rs.getBigDecimal(
-                                                                                                        "INR_BALANCE")
-                                                                                                        .doubleValue());
-
-                                        if (rowNum.get() % 5000 == 0) {
-
-                                                try {
-
-                                                        sheet.flushRows(500);
-
-                                                } catch (IOException e) {
-
-                                                        throw new RuntimeException(e);
-                                                }
-
-                                                log.info(
-                                                                "Processed {} rows",
-                                                                rowNum.get());
-                                        }
-
-                                });
-
-                                sheet.flushRows();
-
-                                sheet.setColumnWidth(0, 4000);
-                                sheet.setColumnWidth(1, 5000);
-                                sheet.setColumnWidth(2, 12000);
-                                sheet.setColumnWidth(3, 4000);
-                                sheet.setColumnWidth(4, 9000);
-                                sheet.setColumnWidth(5, 7000);
-                                sheet.setColumnWidth(6, 7000);
-
-                                workbook.write(out);
-
-                                byte[] bytes = out.toByteArray();
-
-                                workbook.dispose();
-
-                                SearchCriteriaDTO search = new SearchCriteriaDTO();
-
-                                search.setCircle(dto.getCircle());
-                                search.setCurrency(
-                                                String.join(", ", dto.getCurrencies()));
-                                search.setCgl(
-                                                String.join(", ", dto.getCgls()));
-                                search.setBalanceDate(dto.getBalanceDate());
-
-                                sendToMyDownloads(
-                                                userId,
-                                                dto,
-                                                search,
-                                                bytes);
-
-                                log.info(
-                                                "Consolidated Export Completed In {} sec",
-                                                (System.currentTimeMillis() - start) / 1000);
-
-                                return bytes;
-
-                        }
-
-                } catch (IOException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Consolidated Export Failed due to an IO exception.");
-                        throw new RuntimeException("Failed to generate Excel", e);
-                } catch (DataAccessException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Database error occurred during consolidated export.");
-                        throw new RuntimeException("Database error during export", e);
-                }
-        }
-
-        private void validateCollationLimit(
-                        LedgerWiseBalanceRequest dto) {
-
-                StringBuilder sql = new StringBuilder("""
-                                SELECT COUNT(*)
-                                FROM GL_BALANCE g
-                                JOIN BRANCH_MASTER b
-                                    ON g.BRANCH_CODE = b.CODE
-                                WHERE 1=1
-                                """);
-
-                List<Object> params = new ArrayList<>();
-
-                sql.append("""
-                                AND g.BALANCE_DATE =
-                                    TO_DATE(?,'DD/MM/YYYY')
-                                """);
-
-                params.add(dto.getBalanceDate());
-
-                if (!dto.getCgls().contains("ALL")) {
-
-                        sql.append(" AND g.CGL IN (");
-
-                        sql.append(dto.getCgls()
-                                        .stream()
-                                        .map(v -> "?")
-                                        .collect(Collectors.joining(",")));
-
-                        sql.append(")");
-
-                        params.addAll(dto.getCgls());
-                }
-
-                if (!dto.getCurrencies().contains("ALL")) {
-
-                        sql.append(" AND g.CURRENCY IN (");
-
-                        sql.append(dto.getCurrencies()
-                                        .stream()
-                                        .map(v -> "?")
-                                        .collect(Collectors.joining(",")));
-
-                        sql.append(")");
-
-                        params.addAll(dto.getCurrencies().stream().map(String::trim).toList());
-                }
-
-                if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE <> ? ");
-                        params.add(FOREIGN_CIRCLE);
-
-                } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE = ? ");
-                        params.add(FOREIGN_CIRCLE);
-
-                } else if (!"ALL".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE = ? ");
-                        params.add(dto.getCircle());
-                }
-
-                if (dto.getBranches() != null &&
-                                !dto.getBranches().contains("ALL") &&
-                                !dto.getBranches().isEmpty()) {
-
-                        sql.append(" AND g.BRANCH_CODE IN (");
-
-                        sql.append(dto.getBranches()
-                                        .stream()
-                                        .map(v -> "?")
-                                        .collect(Collectors.joining(",")));
-
-                        sql.append(")");
-
-                        params.addAll(dto.getBranches());
-                }
-
-                sql.append("""
-                                AND (
-                                    NVL(g.BALANCE,0) <> 0
-                                    OR NVL(g.INR_BALANCE,0) <> 0
-                                )
-                                """);
-
-                Long count = jdbcTemplate.queryForObject(
-                                sql.toString(),
-                                Long.class,
-                                params.toArray());
-
-                if (count != null && count > MAX_EXPORT_LIMIT) {
-
-                        throw new ExportLimitException(
-                                        "Excel export cannot be generated because the result contains more than 10 lakh records.");
-                }
-        }
-
-        private void validateConsolidatedLimit(
-                        LedgerWiseBalanceRequest dto) {
-
-                StringBuilder sql = new StringBuilder("""
-                                SELECT COUNT(*)
-                                FROM (
-
-                                    SELECT
-                                        g.CGL,
-                                        g.CURRENCY
-
-                                    FROM GL_BALANCE g
-
-                                    JOIN BRANCH_MASTER b
-                                        ON g.BRANCH_CODE = b.CODE
-
-                                    WHERE 1=1
-                                """);
-
-                List<Object> params = new ArrayList<>();
-
-                sql.append("""
-                                AND g.BALANCE_DATE =
-                                    TO_DATE(?,'DD/MM/YYYY')
-                                """);
-
-                params.add(dto.getBalanceDate());
-
-                if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE <> ? ");
-                        params.add(FOREIGN_CIRCLE);
-
-                } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE = ? ");
-                        params.add(FOREIGN_CIRCLE);
-
-                } else if (!"ALL".equalsIgnoreCase(dto.getCircle())) {
-
-                        sql.append(" AND b.CIRCLE_CODE = ? ");
-                        params.add(dto.getCircle());
-                }
-
-                if (!dto.getCurrencies().contains("ALL")) {
-
-                        sql.append(" AND g.CURRENCY IN (");
-
-                        sql.append(dto.getCurrencies().stream()
-                                        .map(v -> "?")
-                                        .collect(Collectors.joining(",")));
-
-                        sql.append(")");
-
-                        params.addAll(dto.getCurrencies().stream().map(String::trim).toList());
-                }
-
-                if (!dto.getCgls().contains("ALL")) {
-
-                        sql.append(" AND g.CGL IN (");
-
-                        sql.append(dto.getCgls().stream()
-                                        .map(v -> "?")
-                                        .collect(Collectors.joining(",")));
-
-                        sql.append(")");
-
-                        params.addAll(dto.getCgls());
-                }
-
-                sql.append("""
-
-                                GROUP BY
-                                    g.CGL,
-                                    g.CURRENCY
-
-                                HAVING
-                                    SUM(g.BALANCE) <> 0
-                                    OR SUM(g.INR_BALANCE) <> 0
-
-                                )
-
-                                """);
-
-                Long count = jdbcTemplate.queryForObject(
-                                sql.toString(),
-                                Long.class,
-                                params.toArray());
-
-                if (count != null && count > MAX_EXPORT_LIMIT) {
-
-                        throw new ExportLimitException(
-                                        "Excel export cannot be generated because the result contains more than 10 lakh records.");
-                }
-        }
-
-        private void createCollationHeader(
-                        Workbook workbook,
-                        Sheet sheet,
-                        LedgerWiseBalanceRequest dto) {
-
-                createReportHeader(
-                                workbook,
-                                sheet,
-                                "Ledger Wise Balance - Collation",
-                                dto,
-                                COLLATION_COLUMNS,
-                                11);
-        }
-
-        private void createConsolidatedHeader(
-                        Workbook workbook,
-                        Sheet sheet,
-                        LedgerWiseBalanceRequest dto) {
-
-                createReportHeader(
-                                workbook,
-                                sheet,
-                                "Ledger Wise Balance - Consolidated",
-                                dto,
-                                CONSOLIDATED_COLUMNS,
-                                6);
-        }
-
-        private void createReportHeader(
-                        Workbook workbook,
-                        Sheet sheet,
-                        String title,
-                        LedgerWiseBalanceRequest dto,
-                        String[] columns,
-                        int lastColumn) {
-
-                Font titleFont = workbook.createFont();
-                titleFont.setBold(true);
-                titleFont.setFontHeightInPoints((short) 14);
-
-                CellStyle titleStyle = workbook.createCellStyle();
-                titleStyle.setFont(titleFont);
-
-                titleStyle.setAlignment(HorizontalAlignment.CENTER);
-
-                Font metaFont = workbook.createFont();
-                metaFont.setBold(true);
-
-                CellStyle metaStyle = workbook.createCellStyle();
-                metaStyle.setFont(metaFont);
-                metaStyle.setAlignment(HorizontalAlignment.CENTER);
-
-                Font headerFont = workbook.createFont();
-                headerFont.setBold(true);
-
-                CellStyle headerStyle = workbook.createCellStyle();
-                headerStyle.setFont(headerFont);
-
-                Row titleRow = sheet.createRow(0);
-
-                Cell titleCell = titleRow.createCell(0);
-                titleCell.setCellValue(title);
-                titleCell.setCellStyle(titleStyle);
-
-                Row metaRow = sheet.createRow(1);
-
-                Cell metaCell = metaRow.createCell(0);
-
-                metaCell.setCellValue(
-                                "Circle : " + dto.getCircle()
-                                                + " | CGL : " + String.join(", ", dto.getCgls())
-                                                + " | Currency : " + String.join(", ", dto.getCurrencies())
-                                                + " | Date : " + dto.getBalanceDate());
-
-                metaCell.setCellStyle(metaStyle);
-
-                titleStyle.setVerticalAlignment(VerticalAlignment.CENTER);
-                metaStyle.setVerticalAlignment(VerticalAlignment.CENTER);
-
-                sheet.addMergedRegion(
-                                new CellRangeAddress(
-                                                0,
-                                                0,
-                                                0,
-                                                lastColumn));
-
-                titleRow.setHeightInPoints(24);
-
-                sheet.addMergedRegion(
-                                new CellRangeAddress(
-                                                1,
-                                                1,
-                                                0,
-                                                lastColumn));
-
-                metaRow.setHeightInPoints(20);
-                sheet.createRow(2);
-
-                Row header = sheet.createRow(3);
-
-                for (int i = 0; i < columns.length; i++) {
-
-                        Cell cell = header.createCell(i);
-
-                        cell.setCellValue(columns[i]);
-
-                        cell.setCellStyle(headerStyle);
-                }
-        }
-
-        private void setColumnWidths(
-                        Sheet sheet) {
-
-                sheet.setColumnWidth(0, 4000);
-                sheet.setColumnWidth(1, 5000);
-                sheet.setColumnWidth(2, 3500);
-                sheet.setColumnWidth(3, 10000);
-                sheet.setColumnWidth(4, 3500);
-                sheet.setColumnWidth(5, 10000);
-                sheet.setColumnWidth(6, 3500);
-                sheet.setColumnWidth(7, 7000);
-                sheet.setColumnWidth(8, 3500);
-                sheet.setColumnWidth(9, 12000);
-                sheet.setColumnWidth(10, 7000);
-                sheet.setColumnWidth(11, 7000);
-        }
-
-        private static final String[] COLLATION_COLUMNS = {
-                        "ID",
-                        "BALANCE DATE",
-                        "CIRCLE CODE",
-                        "CIRCLE NAME",
-                        "BRANCH CODE",
-                        "BRANCH NAME",
-                        "CURRENCY CODE",
-                        "CURRENCY NAME",
-                        "CGL",
-                        "DESCRIPTION",
-                        "BALANCE",
-                        "INR BALANCE"
-        };
-
-        private static final String[] CONSOLIDATED_COLUMNS = {
-                        "ID",
-                        "CGL",
-                        "DESCRIPTION",
-                        "CURRENCY CODE",
-                        "CURRENCY NAME",
-                        "BALANCE",
-                        "INR BALANCE"
-        };
-
-        private void sendToMyDownloads(
-                        String userId,
-                        LedgerWiseBalanceRequest requestDto,
-                        SearchCriteriaDTO dto,
-                        byte[] content) {
-
-                try {
-
-                        String json = new ObjectMapper()
-                                        .writeValueAsString(dto);
-
-                        String fileName = requestDto.getEnquiryType() == ReportType.CONSOLIDATED
-                                        ? "Ledger_Wise_Balance_Consolidated.xlsx"
-                                        : "Ledger_Wise_Balance_Collation.xlsx";
-
-                        int menuId = requestDto.getMenuId();
-
-                        if (!(menuId == 58 || menuId == 59)) {
-                                menuId = 59;
-                        }
-                        MyDownloadsRequestDTO request = new MyDownloadsRequestDTO(
-                                        userId,
-                                        fileName,
-                                        menuId,
-                                        json,
-                                        content);
-
-                        myDownloadsService.insertRequest(request);
-
-                } catch (JsonProcessingException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Failed to serialize download request due to JSON processing error.");
-
-                } catch (DataAccessException e) {
-                        // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-                        log.error("Failed to save download request due to a database error.");
-                }
-        }
-
-        private String safeString(
-                        Object value) {
-
-                return value != null
-                                ? value.toString()
-                                : "";
-        }
-
+2	Solution
+2.1	Technical Feasibility of the Proposed Solution
+The solution proposed in this document is technically feasible subject to assumptions and limitations. 
+2.2	Scope of changes
+Currently on entering the valid User ID and password user is allowed to access the FinCore application. With this change upon submitting the valid credentials application will send the One Time Passcode. To implement the OTP verification in FinCore application following changes are in scope. 
+•	Mobile/Email Check
+•	Code generation
+•	Code sending
+•	Resending
+•	Wrong Attempts
+•	Expiry
+•	Verification
+OTP will be compulsory for every user trying to login in the FinCore application. The login screen shall undergo changes in order to accommodate this functionality.
+2.2.1	Mobile/Email Check
+Upon valid credentials entered by the user, application to check if mobile number and/or email address present in database. If neither is present code shall not be sent.
+2.2.2	Code generation
+Application to generate 6-digit random code when user id has either mobile number or email id. The code to be hashed using bcrypt before storing and not in plain text.
+2.2.3	Code Input
+After sending the code, the application shall display the input for 6-digit code and await user input for validation. Only numeric inputs to be allowed.
+2.2.4	Code Sending
+The code to be sent to both the registered mobile number and email id or whichever is present. Application shall show masked mobile and/or email to which code has been sent.
+2.2.5	Resending
+Application to enable resend button after 60 seconds. A maximum of 3 resends shall be allowed per user within a 10-minute window. Every resend to regenerate a new code and reset the attempt counter.
+2.2.6	Wrong Attempts
+Every generated code to have 5 attempts for verification. Upon entering a wrong code for 5 times, it will be marked as expired and user need to click on resend code button for receiving a new code.
+2.2.7	 Code Expiry
+An OTP to be considered as Expired under either of the following conditions:
+1.	After 5 minutes from the time of its generation
+2.	5 consecutive failed verification attempts
+User can’t login with the expired code. 
+2.2.8	Verification
+Upon successful verification of the code user is allowed to use the application. The validated code to be immediately invalidated and deleted to ensure that it is for one-time use only.
+2.2.9	OTP entry Screen time-out
+In case the user remains idle on OTP entry screen for 15 minutes, the user will be prompted to enter user ID and password again.
+
+
+Message	Scenario
+Code cannot be sent: No valid mobile number or email address is mapped with User ID.	Neither mobile nor email present
+Please enter a valid 6-digit numeric code.	Input is not 6 digits / non-numeric
+The code is invalid or has expired. Please request a new code.	Code expired (> 5 min) or invalid
+Invalid code. {N} attempts remaining.	Wrong code, attempts < 5
+Too many incorrect attempts. The code has been expired. Please request a new code.	On 5th failed attempt
+Maximum resend limit reached. Kindly Wait.	3 resend in 10-min exceeded
+Code sent to ***1234 and a***o@sbi.co.in	Both mobile & email 
+Code sent to ***1234	Only mobile present
+Code sent to a***o@sbi.co.in	Only email present
+New Code sent to ***1234 and a***o@sbi.co.in	Resend both mobile & email
+New Code sent to ***1234	Resend Only mobile
+New Code sent to a***o@sbi.co.in	Resend Only email
+Please wait {N} seconds before requesting another code.	Resend clicked before 60-sec
+Unable to reach the SMS/email provider. Please try again after some time.	SMS/Email API returns error
+Your session has timed out. Please log in again.	OTP entry screen idle > 15 min
+
+
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import axios from "axios";
+import api from "../../config/axiosConfig";
+import { useDispatch, useSelector } from "react-redux";
+import { useNavigate } from "react-router-dom";
+import { Box, InputAdornment, IconButton } from "@mui/material";
+import PersonIcon from "@mui/icons-material/Person";
+import LockIcon from "@mui/icons-material/Lock";
+import Visibility from "@mui/icons-material/Visibility";
+import VisibilityOff from "@mui/icons-material/VisibilityOff";
+import JSEncrypt from "jsencrypt";
+import { jwtDecrypt } from "jose"; // <-- Added jose import for JWE
+import LogoImg from "../../assets/Logos/Fincore_transperent.svg";
+import LoginErrorDialog from "./components/LoginErrorDialog";
+import LoginWithOTP from "./components/LoginWithOTP";
+import fTitle from "../../assets/Logos/Fincore_title.png";
+import UpdatePassword from "./components/UpdatePassword";
+import {
+  Root,
+  ContainerInner,
+  Content,
+  LeftCol,
+  RightCol,
+  LogoWrap,
+  BrandSub,
+  BigHeading,
+  SubText,
+  FeatureList,
+  FeatureItem,
+  Bullet,
+  GlassCard,
+  FormTitle,
+  StyledTextField,
+  PrimaryButton,
+  SubHeadingText,
+} from "./components/LoginStyles";
+import { resolveConfig } from "../../config/EnvironmentConfig";
+import Copyright from "../../components/Copyright";
+import { loginSuccess } from "../../store/slices/authSlice";
+import { setMenus, setSelectedMenuItem } from "../../store/slices/menuSlice";
+import { setTabId } from "../../store/slices/tabSlice";
+
+export default function Login() {
+  const [content, setContent] = useState(null);
+  const { publicKey } = useSelector((state) => state.appConfig);
+
+  const dispatch = useDispatch();
+  const navigate = useNavigate();
+  const menus = useSelector((state) => state.menus.menus);
+
+  const [userId, setUserId] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+
+  const [error, setError] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+
+  const [page, setPage] = useState("HOME"); // HOME | UPDATE | OTP
+  const [dialogConfig, setDialogConfig] = useState({
+    show: false,
+    heading: "",
+    content: "",
+    type: "error", // invalid | error | locked | restricted | rateLimit | denied | warning
+  });
+  const [loading, setLoading] = useState(false);
+  const [userIdDisabled, setUserIdDisabled] = useState(false);
+  const [otpData, setOtpData] = useState(null);
+
+  const userIdInputRef = useRef(null);
+  const passwordInputRef = useRef(null);
+
+  // Load static content JSON
+  useEffect(() => {
+    const loadContent = async () => {
+      try {
+        const res = await axios.get("/loginContent.json");
+        setContent(res.data);
+      } catch (err) {
+        console.error("Failed to load content JSON:", err);
+      }
+    };
+    loadContent();
+  }, []);
+
+  // Focus User ID initially
+  useEffect(() => {
+    let timer;
+    if (page === "HOME" && userIdInputRef.current && !loading) {
+      timer = setTimeout(() => {
+        userIdInputRef.current.focus();
+      }, 100);
+    }
+    return () => clearTimeout(timer);
+  }, [page, loading]);
+
+  // Post-authentication navigation handler
+  useEffect(() => {
+    if (menus?.length > 0 && menus[0]?.route) {
+      const targetRoute = menus[0].hasChildren
+        ? `/choose-option${menus[0].route}`
+        : menus[0].route;
+      navigate(targetRoute, { replace: true });
+    }
+  }, [menus, navigate]);
+
+  const handleDialogClose = useCallback(() => {
+    setDialogConfig({ show: false, heading: "", content: "", type: "error" });
+  }, []);
+
+  const openLoginErrorDialog = useCallback(
+    (heading, content, type = "error") => {
+      setDialogConfig({ show: true, heading, content, type });
+    },
+    [],
+  );
+
+  const validateId = (id) => {
+    if (!id) return false;
+    const regex = /^(?:\d{7}|v\d{7}|tcs\d{7}|tcsv\d{7})$/;
+    return regex.test(id.trim().toLowerCase());
+  };
+
+  const handleUserIdChange = (raw) => {
+    if (userIdDisabled) return;
+    const val = (raw || "").replace(/\s+/g, "");
+    const m = val.match(/^([A-Za-z]*)(.*)$/);
+    let prefixCandidate = (m?.[1] || "").toLowerCase();
+    const rest = m?.[2] || "";
+
+    const allowedPrefixList = ["", "t", "tc", "tcs", "tcsv", "v"];
+    if (!allowedPrefixList.some((p) => prefixCandidate.startsWith(p))) {
+      prefixCandidate = "";
+    }
+
+    let digitsPart = rest.replace(/\D/g, "");
+    if (digitsPart.length > 7) digitsPart = digitsPart.slice(0, 7);
+
+    const newVal = prefixCandidate + digitsPart;
+    if (digitsPart.length <= 7) {
+      setUserId(newVal);
+    }
+    if (error) setError("");
+  };
+
+  const handleUserIdPaste = (e) => {
+    e.preventDefault();
+    const paste = (e.clipboardData || window.clipboardData).getData("text");
+    handleUserIdChange(paste);
+  };
+
+  // Unified Login & Validation Execution
+  const handleLogin = async (e) => {
+    if (e) e.preventDefault();
+    if (loading) return; // Prevent double-clicks
+
+    setError("");
+    setPasswordError("");
+
+    if (!validateId(userId)) {
+      setError("Invalid User ID");
+      userIdInputRef.current?.focus();
+      return;
+    }
+
+    if (!password || password.trim().length < 8) {
+      setPasswordError("Password must be at least 8 characters.");
+      passwordInputRef.current?.focus();
+      return;
+    }
+
+    if (!publicKey) {
+      openLoginErrorDialog(
+        "Initialization Error",
+        "Encryption key failed to fetch. Please refresh the page and try again.",
+        "warning",
+      );
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const payloadUserId = userId.trim();
+
+      // Encrypt the password using the fetched key
+      const encryptor = new JSEncrypt();
+      encryptor.setPublicKey(publicKey);
+      const encryptedPassword = encryptor.encrypt(password);
+
+      if (!encryptedPassword) throw new Error("Encryption failed.");
+
+      const res = await api.post(`${resolveConfig("/LS")}/auth/login`, {
+        userId: payloadUserId,
+        password: encryptedPassword,
+      });
+
+      const result = res?.data?.data || {};
+
+      // Support fetching AES key mapped from Axios headers (Axios lowercases header keys)
+      if (!result.payloadEncryptionKey) {
+        result.payloadEncryptionKey = res.headers["x-payload-key"];
+      }
+
+      if (res.status === 202 && res?.data?.success) {
+        setOtpData(result);
+        setPage("OTP");
+      } else if (res.status === 200 && res?.data?.success) {
+        await handleDirectSessionEstablish(result); // <-- Added await for JWE decryption
+      } else {
+        openLoginErrorDialog(
+          "Login Failed",
+          result.message ||
+            res?.data?.message ||
+            "Something went wrong, please try again.",
+          "error",
+        );
+      }
+    } catch (err) {
+      console.error("Login error:", err);
+
+      // Handle Network / CORS Errors
+      if (!err.response) {
+        openLoginErrorDialog(
+          "Network Error",
+          "Unable to reach the server. Please check your internet connection.",
+          "error",
+        );
+        return;
+      }
+
+      // Handle specific HTTP Status codes
+      const status = err.response.status;
+      const errResult = err.response.data?.data || {};
+      const msg =
+        err.response.data?.message || "Something went wrong, please try again.";
+
+      if (status === 429) {
+        const retryTime =
+          err.response.headers["retry-after"] || "a few minutes";
+        openLoginErrorDialog(
+          "Too Many Requests",
+          `Maximum login attempts exceeded. Please try after ${retryTime} seconds.`,
+          "rateLimit",
+        );
+        return;
+      }
+
+      if (status === 401) {
+        openLoginErrorDialog("Invalid Credentials", msg, "invalid");
+        return;
+      }
+
+      if (status === 428) {
+        setPage("UPDATE");
+        setUserIdDisabled(true);
+        return;
+      }
+
+      // Handle API-specific business logic errors
+      if (errResult?.userStatus === "RESTRICTED") {
+        openLoginErrorDialog(
+          "Access Restricted",
+          "This system is restricted to use FinCore. Please contact the administrator.",
+          "restricted",
+        );
+        return;
+      }
+
+      if (errResult?.passwordLoginStatus === "INACTIVE") {
+        openLoginErrorDialog(
+          "Account Locked",
+          "This account is locked and cannot sign in to FinCore. Please contact the administrator.",
+          "locked",
+        );
+        return;
+      }
+
+      // Default fallback error
+      openLoginErrorDialog("Login Failed", msg, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !loading) {
+      e.preventDefault();
+      handleLogin();
+    }
+  };
+
+  const handlePasswordUpdateSuccess = () => {
+    setPage("HOME");
+    setUserIdDisabled(false);
+    setPassword("");
+  };
+
+  const enableEditingBackToHome = () => {
+    setPage("HOME");
+    setUserIdDisabled(false);
+    setError("");
+    setPasswordError("");
+    setPassword("");
+    setOtpData(null);
+  };
+
+  // Shared token payload & redux session hydration (Updated for JWE parsing)
+  const handleDirectSessionEstablish = async (result) => {
+    if (!result?.roleData?.root_menus?.length) {
+      openLoginErrorDialog(
+        "Access Denied",
+        "You don't have enough permissions to access this application.",
+        "denied",
+      );
+      return;
+    }
+
+    const encryptedToken = result.accessToken;
+    const base64AesKey = result.payloadEncryptionKey;
+
+    if (!base64AesKey) {
+      console.error("Missing Decryption Key in Headers!");
+      openLoginErrorDialog("Login Error", "Missing Decryption Key.", "error");
+      return;
+    }
+
+    let user;
+    try {
+      // Convert the Base64 AES Key into a Cryptographic Buffer
+      const secretKey = Uint8Array.from(atob(base64AesKey), (c) =>
+        c.charCodeAt(0),
+      );
+
+      // Decrypt the token in the browser's memory using jose
+      const { payload } = await jwtDecrypt(encryptedToken, secretKey);
+      user = payload;
+    } catch (error) {
+      console.error("Failed to decrypt the JWE token!", error);
+      openLoginErrorDialog(
+        "Login Error",
+        "Failed to securely read user profile.",
+        "error",
+      );
+      return;
+    }
+
+    const tabId = crypto.randomUUID();
+
+    dispatch(
+      loginSuccess({
+        token: encryptedToken, // Storing raw encrypted token
+        user,
+        payloadEncryptionKey: base64AesKey,
+      }),
+    );
+
+    dispatch(setTabId(tabId));
+    dispatch(setMenus(result.roleData.root_menus));
+    dispatch(setSelectedMenuItem(result.roleData.root_menus[0]));
+
+    const bc = new BroadcastChannel("auth");
+    setTimeout(() => {
+      bc.postMessage({ type: "USER_LOGGED_IN", tabId, userId: user.userId });
+      bc.close(); // Memory cleanup
+    }, 1000);
+  };
+
+  if (!content) return null;
+
+  return (
+    <Root sx={{ justifyContent: "space-between", padding: 0 }}>
+      {/* ... Existing Layout Containers ... */}
+      <Box
+        sx={{
+          flexGrow: 1,
+          display: "flex",
+          alignItems: "center",
+          width: "100%",
+          py: { xs: 4, md: 6 },
+          px: { xs: 2.5, sm: 4, md: 6 },
+        }}
+      >
+        <ContainerInner>
+          <Content
+            sx={{
+              display: "flex",
+              flexDirection: { xs: "column", md: "row" },
+              gap: { xs: 5, md: 4 },
+            }}
+          >
+            <LeftCol>
+              <LogoWrap>
+                <Box
+                  component="img"
+                  src={LogoImg}
+                  alt="Logo Icon"
+                  sx={{ width: { xs: 100, sm: 130, md: 150 }, height: "auto" }}
+                />
+                <Box sx={{ textAlign: { xs: "center", md: "left" } }}>
+                  <Box
+                    component="img"
+                    src={fTitle}
+                    alt="FinCore"
+                    sx={{
+                      height: { xs: 28, md: 35 },
+                      width: "auto",
+                      mx: { xs: "auto", md: 0 },
+                      mt: { xs: 2, md: 5 },
+                      mb: 1,
+                    }}
+                  />
+                  <BrandSub>{content?.brand?.subtitle}</BrandSub>
+                </Box>
+              </LogoWrap>
+
+              <Box
+                sx={{
+                  display: { xs: "none", md: "block" },
+                  mt: 2,
+                  mb: 1,
+                  textAlign: { xs: "center", md: "left" },
+                }}
+              >
+                <BigHeading>
+                  {(content?.hero?.welcomeTitle || "").split(" - ")[0]}
+                </BigHeading>
+                {content?.hero?.welcomeTitle?.includes(" - ") && (
+                  <SubHeadingText>
+                    {content?.hero?.welcomeTitle.split(" - ")[1]}
+                  </SubHeadingText>
+                )}
+              </Box>
+
+              <SubText
+                sx={{
+                  display: { xs: "none", md: "block" },
+                  textAlign: { xs: "center", md: "left" },
+                }}
+              >
+                {content?.hero?.subText}
+              </SubText>
+
+              <Box sx={{ display: { xs: "none", md: "block" }, mt: 3 }}>
+                <BigHeading>{content?.legal?.title}</BigHeading>
+                <FeatureList sx={{ mt: 2 }}>
+                  {content?.legal?.items.map((item, idx) => (
+                    <FeatureItem key={idx}>
+                      <Bullet /> {item}
+                    </FeatureItem>
+                  ))}
+                </FeatureList>
+              </Box>
+            </LeftCol>
+
+            <RightCol
+              sx={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                width: "100%",
+              }}
+            >
+              <GlassCard elevation={3} sx={{ width: "100%" }}>
+                <FormTitle align="center">
+                  {page === "OTP"
+                    ? "Two-Factor Verification"
+                    : content?.form?.signIn}
+                </FormTitle>
+
+                {page === "HOME" && (
+                  <form onSubmit={handleLogin}>
+                    <StyledTextField
+                      fullWidth
+                      required
+                      inputRef={userIdInputRef}
+                      label="User ID"
+                      placeholder={content?.form?.userIdPlaceholder}
+                      margin="dense"
+                      value={userId}
+                      onChange={(e) => handleUserIdChange(e.target.value)}
+                      onPaste={handleUserIdPaste}
+                      onKeyDown={handleKeyDown}
+                      error={Boolean(error)}
+                      helperText={error || " "}
+                      disabled={userIdDisabled || loading}
+                      autoComplete="username"
+                      InputProps={{
+                        startAdornment: (
+                          <InputAdornment position="start">
+                            <PersonIcon />
+                          </InputAdornment>
+                        ),
+                      }}
+                    />
+
+                    <StyledTextField
+                      fullWidth
+                      required
+                      inputRef={passwordInputRef}
+                      label="Password"
+                      placeholder="Enter your Password"
+                      type={showPassword ? "text" : "password"}
+                      margin="dense"
+                      value={password}
+                      onChange={(e) => {
+                        setPassword(e.target.value);
+                        if (passwordError) setPasswordError("");
+                      }}
+                      onKeyDown={handleKeyDown}
+                      error={Boolean(passwordError)}
+                      helperText={passwordError || " "}
+                      disabled={loading}
+                      autoComplete="current-password"
+                      InputProps={{
+                        startAdornment: (
+                          <InputAdornment position="start">
+                            <LockIcon />
+                          </InputAdornment>
+                        ),
+                        endAdornment: password.trim() && (
+                          <InputAdornment position="end">
+                            <IconButton
+                              onClick={() => setShowPassword(!showPassword)}
+                              edge="end"
+                              disabled={loading}
+                              type="button"
+                              aria-label={
+                                showPassword ? "Hide password" : "Show password"
+                              }
+                            >
+                              {showPassword ? (
+                                <Visibility />
+                              ) : (
+                                <VisibilityOff />
+                              )}
+                            </IconButton>
+                          </InputAdornment>
+                        ),
+                      }}
+                    />
+
+                    <PrimaryButton
+                      type="submit"
+                      variant="contained"
+                      disabled={
+                        loading || !userId || password.trim().length < 8
+                      }
+                    >
+                      {loading
+                        ? content?.form?.checking || "Verifying..."
+                        : content?.form?.signInButton}
+                    </PrimaryButton>
+                  </form>
+                )}
+
+                {page === "OTP" && (
+                  <LoginWithOTP
+                    userId={userId}
+                    otpData={otpData}
+                    openLoginErrorDialog={openLoginErrorDialog}
+                    onBackToHome={enableEditingBackToHome}
+                    onSessionEstablished={handleDirectSessionEstablish}
+                  />
+                )}
+
+                {page === "UPDATE" && (
+                  <UpdatePassword
+                    userId={userId}
+                    publicKey={publicKey}
+                    openLoginErrorDialog={openLoginErrorDialog}
+                    onUpdateSuccess={handlePasswordUpdateSuccess}
+                  />
+                )}
+              </GlassCard>
+
+              {/* Mobile Legal Box */}
+              <Box
+                sx={{
+                  display: { xs: "block", md: "none" },
+                  mt: 5,
+                  width: "100%",
+                }}
+              >
+                <BigHeading
+                  sx={{
+                    fontSize: { xs: "1.2rem", md: "1.5rem" },
+                    textAlign: "center",
+                    mb: 2,
+                  }}
+                >
+                  {content?.legal?.title}
+                </BigHeading>
+                <FeatureList>
+                  {content?.legal?.items.map((item, idx) => (
+                    <FeatureItem
+                      key={idx}
+                      sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
+                    >
+                      <Bullet /> <span style={{ flex: 1 }}>{item}</span>
+                    </FeatureItem>
+                  ))}
+                </FeatureList>
+              </Box>
+            </RightCol>
+          </Content>
+        </ContainerInner>
+      </Box>
+
+      <Box sx={{ width: "100%", zIndex: 2 }}>
+        <Copyright />
+      </Box>
+
+      {/* Passed type dynamically here */}
+      <LoginErrorDialog
+        showErrorDialog={dialogConfig.show}
+        title={dialogConfig.heading}
+        content={dialogConfig.content}
+        type={dialogConfig.type}
+        onDialogClose={handleDialogClose}
+      />
+    </Root>
+  );
 }
 
 
 
-
-
-package com.fincore.enquiry_service.service;
-
-import java.time.ZonedDateTime;
-import java.util.List;
-import java.util.stream.Collectors;
-
-import org.springframework.dao.DataAccessException;
-import org.springframework.stereotype.Service;
-
-import com.fincore.enquiry_service.dto.DownloadsResponseDTO;
-import com.fincore.enquiry_service.dto.MyDownloadsRequestDTO;
-import com.fincore.enquiry_service.exception.UserIdMismatchException;
-import com.fincore.enquiry_service.model.UserDownloads;
-import com.fincore.enquiry_service.model.UserDownloadsData;
-import com.fincore.enquiry_service.repository.UserDownloadsDataRepository;
-import com.fincore.enquiry_service.repository.UserDownloadsRepository;
-
-import jakarta.transaction.Transactional;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-@Service("MyDownloadsService")
-@RequiredArgsConstructor
-public class MyDownloadsServiceImpl implements MyDownloadsService {
-
-	private final UserDownloadsRepository userDownloadsRepository;
-	private final UserDownloadsDataRepository userDownloadsDataRepository;
-
-	@Override
-	public List<DownloadsResponseDTO> getDownloads(String userId) {
-
-		ZonedDateTime twentyFourHoursAgo = ZonedDateTime.now().minusHours(24);
-
-		// fetching the requests of that user
-		List<UserDownloads> entityList = userDownloadsRepository
-				.findByUserIdAndGeneratedAtGreaterThanOrderByIdDesc(userId, twentyFourHoursAgo);
-
-		// mapping the entity to DTO
-
-		return entityList.stream().map(entity -> {
-			DownloadsResponseDTO dto = new DownloadsResponseDTO();
-			dto.setId(entity.getId());
-			dto.setUserId(entity.getUserId());
-			dto.setFileName(entity.getFileName());
-			dto.setMenuId(entity.getMenuId());
-			dto.setSearchCriteria(entity.getSearchCriteria());
-			dto.setGeneratedAt(entity.getGeneratedAt());
-			return dto;
-		}).collect(Collectors.toList());
-
-	}
-
-	@Override
-	public byte[] download(Long id, String tokenId) {
-		String requestedBy = userDownloadsDataRepository.getUserID(id);
-		if (requestedBy == null) {
-			throw new NullPointerException();
-		} else {
-			if (!requestedBy.equalsIgnoreCase(tokenId)) {
-				throw new UserIdMismatchException(
-						"Access Denied: Security validation failed for this download request.");
-			}
-		}
-
-		return userDownloadsDataRepository.getBlobData(id);
-	}
-
-	@Override
-	@Transactional
-	public Boolean insertRequest(MyDownloadsRequestDTO myDownloadsRequestDTO) {
-		try {
-
-			// inserting the request details in user_downloads table
-			UserDownloads userDownloads = new UserDownloads();
-			userDownloads.setMenuId(myDownloadsRequestDTO.getMenuId());
-			userDownloads.setFileName(myDownloadsRequestDTO.getFileName());
-			userDownloads.setUserId(myDownloadsRequestDTO.getUserId());
-			userDownloads.setSearchCriteria(myDownloadsRequestDTO.getSearchCriteria());
-			// saving the entity
-			userDownloadsRepository.save(userDownloads);
-
-			// inserting the BLOB data in user_downloads_data table with id generated in
-			// above table
-			UserDownloadsData userDownloadsData = new UserDownloadsData();
-
-			userDownloadsData.setDownloadId(userDownloads.getId());
-			userDownloadsData.setFileContent(myDownloadsRequestDTO.getResultData());
-			// saving the entity
-			userDownloadsDataRepository.save(userDownloadsData);
-			return true;
-		} catch (DataAccessException e) {
-			// FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-			log.error("Failed to save download request due to a database error.");
-			return false;
-		}
-	}
-}
-
-
-
-
-package com.fincore.enquiry_service.service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.enquiry_service.dto.LedgerEnquiryRequest;
-import com.fincore.enquiry_service.dto.MyDownloadsRequestDTO;
-import com.fincore.enquiry_service.dto.SearchCriteriaDTO;
-import com.fincore.enquiry_service.exception.ExportLimitException;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.ss.util.CellRangeAddress;
-import org.apache.poi.xssf.streaming.SXSSFSheet;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.sql.ResultSet;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
-import java.lang.RuntimeException;
-
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class LedgerExportService {
-
-    private static final String FOREIGN_CIRCLE = "021";
-
-    private static final long MAX_EXPORT_LIMIT = 1_000_000;
-
-    private static final int FETCH_SIZE = 20_000;
-
-    private final JdbcTemplate jdbcTemplate;
-
-    private final MyDownloadsService myDownloadsService;
-
-    /*
-     * =========================================
-     * EXPORT
-     * =========================================
-     */
-    public byte[] export(LedgerEnquiryRequest dto, String userId) {
-
-        validateExportLimit(dto);
-
-        try {
-
-            /* SQL */
-            StringBuilder sql = new StringBuilder("""
-                    SELECT
-                        g.TRANSACTION_ID,
-                        g.BATCH_ID,
-                        g.JOURNAL_ID,
-                        g.TRANSACTION_DATE,
-                        g.POST_DATE,
-
-                        b.CODE AS BRANCH_CODE,
-                        b.NAME AS BRANCH_NAME,
-
-                        c.CIRCLE_CODE,
-                        c.CIRCLE_NAME,
-
-                        g.CURRENCY,
-                        cu.CURRENCY_NAME,
-
-                        g.CGL,
-                        cg.DESCRIPTION,
-
-                        g.NARRATION,
-
-                        ABS(g.DEBIT_AMOUNT)
-                            AS DEBIT_AMOUNT,
-
-                        ABS(g.CREDIT_AMOUNT)
-                            AS CREDIT_AMOUNT,
-
-                        NVL(
-                            g.TRANSACTION_COUNT,
-                            0
-                        ) AS TRANSACTION_COUNT,
-
-                        sf.FLAG_NAME
-                            AS SOURCE_NAME
-
-                    FROM GL_TRANSACTIONS g
-
-                    JOIN BRANCH_MASTER b
-                        ON g.BRANCH_CODE =
-                            b.CODE
-
-                    LEFT JOIN CIRCLE_MASTER c
-                        ON b.CIRCLE_CODE =
-                            c.CIRCLE_CODE
-
-                    LEFT JOIN CURRENCY_MASTER cu
-                        ON g.CURRENCY =
-                            cu.CURRENCY_CODE
-
-                    LEFT JOIN CGL_MASTER cg
-                        ON g.CGL =
-                            cg.CGL_NUMBER
-
-                    LEFT JOIN SOURCE_FLAG sf
-                        ON g.SOURCE_FLAG =
-                            sf.FLAG_ID
-
-                    WHERE 1 = 1
-                    """);
-
-            /* PARAMS */
-            List<Object> params = new ArrayList<>();
-
-            /* CGL */
-            sql.append("""
-                    AND g.CGL = ?
-                    """);
-            params.add(dto.getCgl());
-
-            /* CURRENCY */
-            if (dto.getCurrencies() != null && !dto.getCurrencies().isEmpty() && !dto.getCurrencies().contains("ALL")) {
-                sql.append("""
-                        AND g.CURRENCY IN (
-                        """);
-                sql.append(dto.getCurrencies().stream().map(v -> "?").collect(Collectors.joining(",")));
-                sql.append(")");
-                params.addAll(dto.getCurrencies());
-            }
-
-            /* DATES */
-            sql.append("""
-                    AND g.TRANSACTION_DATE
-                    BETWEEN
-                        TO_DATE(?,'DD/MM/YYYY')
-                    AND
-                        TO_DATE(?,'DD/MM/YYYY')
-                    """);
-
-            params.add(dto.getFromDate());
-            params.add(dto.getToDate());
-
-            /* CIRCLE */
-            if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-                sql.append("""
-                        AND c.CIRCLE_CODE <> ?
-                        """);
-                params.add(FOREIGN_CIRCLE);
-            } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-                sql.append("""
-                        AND c.CIRCLE_CODE = ?
-                        """);
-                params.add(FOREIGN_CIRCLE);
-            } else if (dto.getCircle() != null && !"ALL".equalsIgnoreCase(dto.getCircle())) {
-                sql.append("""
-                        AND c.CIRCLE_CODE = ?
-                        """);
-                params.add(dto.getCircle());
-            }
-
-            /* BRANCHES */
-            if (dto.getBranches() != null && !dto.getBranches().isEmpty() && !dto.getBranches().contains("ALL")) {
-                sql.append("""
-                        AND g.BRANCH_CODE IN (
-                        """);
-                sql.append(dto.getBranches().stream().map(v -> "?").collect(Collectors.joining(",")));
-                sql.append(")");
-                params.addAll(dto.getBranches());
-            }
-
-            /* SOURCE FLAGS */
-            if (dto.getSourceFlags() != null && !dto.getSourceFlags().isEmpty()) {
-                sql.append("""
-                        AND g.SOURCE_FLAG IN (
-                        """);
-                sql.append(dto.getSourceFlags().stream().map(v -> "?").collect(Collectors.joining(",")));
-                sql.append(")");
-                params.addAll(dto.getSourceFlags());
-            }
-
-            /* SORT */
-            sql.append("""
-                    ORDER BY
-                        g.TRANSACTION_DATE DESC
-                    """);
-
-            log.info("Ledger Export Started");
-
-            long start = System.currentTimeMillis();
-
-            /* EXCEL */
-            try (
-
-                    SXSSFWorkbook workbook = new SXSSFWorkbook(1000);
-                    ByteArrayOutputStream out = new ByteArrayOutputStream()
-
-            ) {
-
-                workbook.setCompressTempFiles(true);
-                SXSSFSheet sheet = workbook.createSheet("Ledger");
-
-                /* HEADER */
-                createReportHeader(workbook, sheet, dto);
-
-                /* DATA STARTS FROM ROW 4 */
-                AtomicInteger rowNum = new AtomicInteger(4);
-                jdbcTemplate.setFetchSize(FETCH_SIZE);
-                jdbcTemplate.query(connection -> {
-                    var ps = connection.prepareStatement(sql.toString());
-                    ps.setFetchSize(FETCH_SIZE);
-                    for (int i = 0; i < params.size(); i++) {
-                        ps.setObject(i + 1, params.get(i));
-                    }
-                    return ps;
-                },
-
-                        (ResultSet rs) -> {
-                            Row row = sheet.createRow(rowNum.getAndIncrement());
-                            int col = 0;
-                            row.createCell(col++).setCellValue(safeString(rs.getString("TRANSACTION_ID")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("BATCH_ID")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("JOURNAL_ID")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("TRANSACTION_DATE")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("POST_DATE")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("CIRCLE_CODE")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("CIRCLE_NAME")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("BRANCH_CODE")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("BRANCH_NAME")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("CURRENCY")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("CURRENCY_NAME")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("CGL")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("DESCRIPTION")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("NARRATION")));
-                            row.createCell(col++).setCellValue(safeString(rs.getString("SOURCE_NAME")));
-                            row.createCell(col++)
-                                    .setCellValue(rs.getBigDecimal("DEBIT_AMOUNT") != null
-                                            ? rs.getBigDecimal("DEBIT_AMOUNT").doubleValue()
-                                            : 0);
-                            row.createCell(col++)
-                                    .setCellValue(rs.getBigDecimal("CREDIT_AMOUNT") != null
-                                            ? rs.getBigDecimal("CREDIT_AMOUNT").doubleValue()
-                                            : 0);
-                            row.createCell(col++).setCellValue(rs.getLong("TRANSACTION_COUNT"));
-
-                            /* FLUSH */
-                            if (rowNum.get() % 5000 == 0) {
-                                try {
-                                    sheet.flushRows(500);
-                                } catch (IOException e) {
-                                    throw new RuntimeException(e);
-                                }
-                                log.info("Processed Rows : {}", rowNum.get());
-                            }
-                        });
-
-                /* FINAL FLUSH */
-                sheet.flushRows();
-
-                /* WIDTHS */
-                setColumnWidths(sheet);
-
-                /* WRITE */
-                workbook.write(out);
-                byte[] bytes = out.toByteArray();
-                log.info("Generated Excel Size in Bytes : {}", bytes.length);
-                workbook.dispose();
-                SearchCriteriaDTO searchDto = new SearchCriteriaDTO();
-
-                String branches = String.join(", ", dto.getBranches());
-                String currencies = String.join(", ", dto.getCurrencies());
-
-                searchDto.setCircle(dto.getCircle());
-                searchDto.setBranch(branches);
-                searchDto.setCgl(dto.getCgl());
-                searchDto.setCurrency(currencies);
-                searchDto.setFromDate(dto.getFromDate());
-                searchDto.setToDate(dto.getToDate());
-
-                if (dto.getSourceFlags() == null) {
-                    searchDto.setSourceFlags(List.of("ALL"));
-                } else {
-                    searchDto.setSourceFlags(dto.getSourceFlags());
-                }
-
-                /* SAVE DOWNLOAD */
-                sendToMyDownloads(userId, searchDto, bytes);
-                long end = System.currentTimeMillis();
-                log.info("Ledger Export Completed " + "In {} Seconds", (end - start) / 1000);
-                return bytes;
-            }
-
-        } catch (IOException e) {
-            // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-            log.error("Ledger Export Failed due to an IO exception.");
-            throw new RuntimeException("Failed to generate Excel", e);
-        } catch (DataAccessException e) {
-            // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-            log.error("Database error occurred during ledger export.");
-            throw new RuntimeException("Database error during export", e);
+import React, { useState, useEffect, useRef } from "react";
+import {
+  Typography,
+  Button,
+  Box,
+  InputBase,
+  Stack,
+  CircularProgress,
+} from "@mui/material";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import EmailIcon from "@mui/icons-material/Email";
+import PhoneAndroidIcon from "@mui/icons-material/PhoneAndroid";
+import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import api from "../../../config/axiosConfig";
+import { resolveConfig } from "../../../config/EnvironmentConfig";
+import { PrimaryButton } from "./LoginStyles";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
+
+const LoginWithOTP = ({
+  userId,
+  otpData,
+  openLoginErrorDialog,
+  onBackToHome,
+  onSessionEstablished,
+}) => {
+  const showSnackbar = useCustomSnackbar();
+
+  const [otpValues, setOtpValues] = useState(["", "", "", "", "", ""]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [wrongAttempts, setWrongAttempts] = useState(0);
+  const [isSessionUnauthorized, setIsSessionUnauthorized] = useState(false);
+
+  // --- API Driven Timers & Limits ---
+  const [currentTxnId, setCurrentTxnId] = useState(
+    otpData?.transactionId || "",
+  );
+  const [expiresIn, setExpiresIn] = useState(otpData?.expiresInSeconds || 300);
+  const [cooldown, setCooldown] = useState(
+    otpData?.resendCooldownSeconds || 30,
+  );
+  const [resendsLeft, setResendsLeft] = useState(
+    otpData?.resendsRemaining ?? 5,
+  );
+
+  const inputRefs = useRef([]);
+
+  const isExpired = expiresIn <= 0 || isSessionUnauthorized;
+  const isExhausted = resendsLeft <= 0;
+  const otpString = otpValues.join("");
+
+  // Focus management
+  useEffect(() => {
+    if (!isExpired && inputRefs.current[0]) {
+      inputRefs.current[0].focus();
+    }
+  }, [isExpired]);
+
+  // Global Tick Timer
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setExpiresIn((prev) => (prev > 0 ? prev - 1 : 0));
+      setCooldown((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatTime = (seconds) => {
+    const m = Math.floor(seconds / 60)
+      .toString()
+      .padStart(2, "0");
+    const s = (seconds % 60).toString().padStart(2, "0");
+    return `${m}:${s}`;
+  };
+
+  const updateTimersFromResponse = (data) => {
+    if (data?.transactionId) setCurrentTxnId(data.transactionId);
+    if (data?.expiresInSeconds) setExpiresIn(data.expiresInSeconds);
+    if (data?.resendCooldownSeconds) setCooldown(data.resendCooldownSeconds);
+    if (data?.resendsRemaining !== undefined)
+      setResendsLeft(data.resendsRemaining);
+  };
+
+  const forceResendOTP = async () => {
+    try {
+      const res = await api.post(
+        `${resolveConfig("/LS") || ""}/auth/resend-otp`,
+        {
+          userId,
+          transactionId: currentTxnId,
+        },
+      );
+
+      updateTimersFromResponse(res?.data?.data);
+      setWrongAttempts(0);
+      setOtpValues(["", "", "", "", "", ""]);
+      showSnackbar(
+        "3 invalid attempts. A fresh verification code was sent.",
+        "warning",
+      );
+      inputRefs.current[0]?.focus();
+    } catch (err) {
+      console.error("Forced OTP Generation Error:", err);
+      openLoginErrorDialog(
+        "Session Terminated",
+        "Could not generate a new code. Please restart login.",
+      );
+    }
+  };
+
+  const handleResendClick = async () => {
+    if (isExhausted || cooldown > 0 || isExpired) return;
+
+    setIsLoading(true);
+    try {
+      const res = await api.post(
+        `${resolveConfig("/LS") || ""}/auth/resend-otp`,
+        {
+          userId,
+          transactionId: currentTxnId,
+        },
+      );
+
+      updateTimersFromResponse(res?.data?.data);
+      setWrongAttempts(0);
+      setOtpValues(["", "", "", "", "", ""]);
+      showSnackbar(
+        res?.data?.message || "A new code has been sent successfully.",
+        "success",
+      );
+      inputRefs.current[0]?.focus();
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 401) {
+        setIsSessionUnauthorized(true);
+        setExpiresIn(0);
+      } else {
+        const msg =
+          err.response?.data?.message || "Failed to resend verification code.";
+        showSnackbar(msg, "error");
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleVerifyOTP = async () => {
+    if (otpString.length !== 6 || isExpired) return;
+
+    setIsLoading(true);
+
+    try {
+      const response = await api.post(
+        `${resolveConfig("/LS") || ""}/auth/verify-otp`,
+        {
+          userId,
+          transactionId: currentTxnId,
+          otp: otpString,
+        },
+      );
+
+      const isSuccess = response?.data?.success === true;
+      const result = response?.data?.data || {};
+
+      // Support fetching AES key mapped from Axios headers (Axios lowercases header keys)
+      if (!result.payloadEncryptionKey) {
+        result.payloadEncryptionKey = response.headers["x-payload-key"];
+      }
+
+      if (isSuccess) {
+        if (onSessionEstablished) {
+          onSessionEstablished(result);
         }
+      } else {
+        const targetFailures = wrongAttempts + 1;
+        setWrongAttempts(targetFailures);
+
+        if (targetFailures >= 3) {
+          await forceResendOTP();
+        } else {
+          showSnackbar(
+            response?.data?.message ||
+              `Invalid code. Attempt ${targetFailures} of 3.`,
+            "error",
+          );
+        }
+      }
+    } catch (e) {
+      const status = e.response?.status;
+
+      // 401: Unauthorized / Expired -> Render expired state
+      if (status === 401) {
+        setIsSessionUnauthorized(true);
+        setExpiresIn(0);
+      }
+      // 400: Invalid OTP
+      else if (status === 400) {
+        const targetFailures = wrongAttempts + 1;
+        setWrongAttempts(targetFailures);
+
+        if (targetFailures >= 3) {
+          await forceResendOTP();
+        } else {
+          showSnackbar(
+            e.response?.data?.message ||
+              `Invalid OTP. Attempt ${targetFailures} of 3.`,
+            "error",
+          );
+        }
+      } else {
+        console.error("OTP Verification Exception:", e);
+        const msg =
+          e.response?.data?.message ||
+          "Verification request failed. Try again.";
+        showSnackbar(msg, "error");
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (index, e) => {
+    if (e.key === "Backspace") {
+      e.preventDefault();
+      const updated = [...otpValues];
+      if (updated[index]) {
+        updated[index] = "";
+        setOtpValues(updated);
+      } else if (index > 0) {
+        updated[index - 1] = "";
+        setOtpValues(updated);
+        inputRefs.current[index - 1]?.focus();
+      }
+    } else if (e.key === "ArrowLeft" && index > 0) {
+      e.preventDefault();
+      inputRefs.current[index - 1]?.focus();
+    } else if (e.key === "ArrowRight" && index < 5) {
+      e.preventDefault();
+      inputRefs.current[index + 1]?.focus();
+    } else if (e.key === "Enter" && otpString.length === 6 && !isLoading) {
+      e.preventDefault();
+      handleVerifyOTP();
+    }
+  };
+
+  const handleChange = (index, e) => {
+    const rawVal = e.target.value;
+    const digitsOnly = rawVal.replace(/\D/g, "");
+
+    if (!digitsOnly) {
+      const updated = [...otpValues];
+      updated[index] = "";
+      setOtpValues(updated);
+      return;
     }
 
-    /*
-     * =========================================
-     * REPORT HEADER
-     * =========================================
-     */
+    const updated = [...otpValues];
 
-    private void createReportHeader(Workbook workbook, Sheet sheet, LedgerEnquiryRequest dto) {
-
-        /* TITLE STYLE */
-
-        Font titleFont = workbook.createFont();
-        titleFont.setBold(true);
-        titleFont.setFontHeightInPoints((short) 14);
-        CellStyle titleStyle = workbook.createCellStyle();
-        titleStyle.setFont(titleFont);
-        titleStyle.setAlignment(HorizontalAlignment.LEFT);
-
-        /* META STYLE */
-        Font metaFont = workbook.createFont();
-        metaFont.setBold(true);
-        CellStyle metaStyle = workbook.createCellStyle();
-        metaStyle.setFont(metaFont);
-
-        /* HEADER STYLE */
-        Font headerFont = workbook.createFont();
-        headerFont.setBold(true);
-        CellStyle headerStyle = workbook.createCellStyle();
-        headerStyle.setFont(headerFont);
-        headerStyle.setAlignment(HorizontalAlignment.LEFT);
-
-        /* ROW 0 */
-        Row titleRow = sheet.createRow(0);
-        Cell titleCell = titleRow.createCell(0);
-        titleCell.setCellValue("Ledger Wise Enquiry Report");
-        titleCell.setCellStyle(titleStyle);
-        sheet.addMergedRegion(new CellRangeAddress(0, 0, 0, 17));
-
-        /* ROW 1 */
-        Row metaRow = sheet.createRow(1);
-        Cell metaCell = metaRow.createCell(0);
-        metaCell.setCellValue("CGL : " + dto.getCgl() + " | Circle : " + dto.getCircle() + " | From : "
-                + dto.getFromDate() + " | To : " + dto.getToDate());
-        metaCell.setCellStyle(metaStyle);
-        sheet.addMergedRegion(new CellRangeAddress(1, 1, 0, 17));
-
-        /* ROW 2 EMPTY */
-        sheet.createRow(2);
-
-        /* ROW 3 HEADER */
-        Row header = sheet.createRow(3);
-        String[] columns = {
-                "TRANSACTION ID",
-                "BATCH ID",
-                "JOURNAL ID",
-                "TRANSACTION DATE",
-                "POST DATE",
-                "CIRCLE CODE",
-                "CIRCLE NAME",
-                "BRANCH CODE",
-                "BRANCH NAME",
-                "CURRENCY CODE",
-                "CURRENCY NAME",
-                "CGL CODE",
-                "DESCRIPTION",
-                "NARRATION",
-                "TRANCTION_TYPE",
-                "DEBIT AMOUNT",
-                "CREDIT AMOUNT",
-                "TRANSACTION COUNT"
-        };
-        for (int i = 0; i < columns.length; i++) {
-            Cell cell = header.createCell(i);
-            cell.setCellValue(columns[i]);
-            cell.setCellStyle(headerStyle);
+    if (digitsOnly.length === 1) {
+      updated[index] = digitsOnly;
+      setOtpValues(updated);
+      if (index < 5) {
+        inputRefs.current[index + 1]?.focus();
+      }
+    } else {
+      const chars = digitsOnly.split("").slice(0, 6);
+      chars.forEach((char, idx) => {
+        if (index + idx < 6) {
+          updated[index + idx] = char;
         }
+      });
+      setOtpValues(updated);
+      const nextTarget = Math.min(index + chars.length, 5);
+      inputRefs.current[nextTarget]?.focus();
     }
+  };
 
-    /*
-     * =========================================
-     * EXPORT LIMIT
-     * =========================================
-     */
-    private void validateExportLimit(LedgerEnquiryRequest dto) {
+  const handlePaste = (e) => {
+    e.preventDefault();
+    const pasted = e.clipboardData
+      .getData("text/plain")
+      .replace(/\D/g, "")
+      .slice(0, 6);
+    if (!pasted) return;
 
-        StringBuilder sql = new StringBuilder("""
-                SELECT COUNT(*)
-                FROM GL_TRANSACTIONS g
-                JOIN BRANCH_MASTER b
-                    ON g.BRANCH_CODE = b.CODE
-                LEFT JOIN CIRCLE_MASTER c
-                    ON b.CIRCLE_CODE = c.CIRCLE_CODE
-                WHERE 1=1
-                """);
-
-        List<Object> params = new ArrayList<>();
-
-        sql.append(" AND g.CGL = ? ");
-        params.add(dto.getCgl());
-
-        sql.append("""
-                AND g.TRANSACTION_DATE
-                BETWEEN TO_DATE(?,'DD/MM/YYYY')
-                AND TO_DATE(?,'DD/MM/YYYY')
-                """);
-
-        params.add(dto.getFromDate());
-        params.add(dto.getToDate());
-
-        // Currency
-        if (dto.getCurrencies() != null && !dto.getCurrencies().isEmpty() && !dto.getCurrencies().contains("ALL")) {
-            sql.append(" AND g.CURRENCY IN (");
-            sql.append(dto.getCurrencies().stream().map(v -> "?").collect(Collectors.joining(",")));
-            sql.append(")");
-            params.addAll(dto.getCurrencies());
-        }
-
-        // Circle
-        if ("DOMESTIC".equalsIgnoreCase(dto.getCircle())) {
-            sql.append(" AND c.CIRCLE_CODE <> ? ");
-            params.add(FOREIGN_CIRCLE);
-
-        } else if ("FOREIGN".equalsIgnoreCase(dto.getCircle())) {
-            sql.append(" AND c.CIRCLE_CODE = ? ");
-            params.add(FOREIGN_CIRCLE);
-
-        } else if (dto.getCircle() != null && !"ALL".equalsIgnoreCase(dto.getCircle())) {
-
-            sql.append(" AND c.CIRCLE_CODE = ? ");
-            params.add(dto.getCircle());
-        }
-
-        // Branches
-        if (dto.getBranches() != null && !dto.getBranches().isEmpty() && !dto.getBranches().contains("ALL")) {
-
-            sql.append(" AND g.BRANCH_CODE IN (");
-            sql.append(dto.getBranches().stream().map(v -> "?").collect(Collectors.joining(",")));
-            sql.append(")");
-
-            params.addAll(dto.getBranches());
-        }
-
-        // Source Flags
-        if (dto.getSourceFlags() != null && !dto.getSourceFlags().isEmpty()) {
-
-            sql.append(" AND g.SOURCE_FLAG IN (");
-            sql.append(dto.getSourceFlags().stream().map(v -> "?").collect(Collectors.joining(",")));
-            sql.append(")");
-
-            params.addAll(dto.getSourceFlags());
-        }
-
-        Long count = jdbcTemplate.queryForObject(sql.toString(), Long.class, params.toArray());
-
-        log.info("Export record count = {}", count);
-
-        if (count != null && count > MAX_EXPORT_LIMIT) {
-            log.info("Export records count = {}", count);
-            throw new ExportLimitException("Excel export cannot be generated for more than 10 lakh records.");
-        }
+    const updated = [...otpValues];
+    for (let i = 0; i < pasted.length; i++) {
+      updated[i] = pasted[i];
     }
+    setOtpValues(updated);
 
-    /*
-     * =========================================
-     * WIDTHS
-     * =========================================
-     */
-    private void setColumnWidths(Sheet sheet) {
+    const targetIdx = pasted.length < 6 ? pasted.length : 5;
+    inputRefs.current[targetIdx]?.focus();
+  };
 
-        sheet.setColumnWidth(0, 4000);
-        sheet.setColumnWidth(1, 2500);
-        sheet.setColumnWidth(2, 3000);
-        sheet.setColumnWidth(3, 5000);
-        sheet.setColumnWidth(4, 5000);
-        sheet.setColumnWidth(5, 3500);
-        sheet.setColumnWidth(6, 10000);
-        sheet.setColumnWidth(7, 3500);
-        sheet.setColumnWidth(8, 10000);
-        sheet.setColumnWidth(9, 3000);
-        sheet.setColumnWidth(10, 7000);
-        sheet.setColumnWidth(11, 3200);
-        sheet.setColumnWidth(12, 12000);
-        sheet.setColumnWidth(13, 11000);
-        sheet.setColumnWidth(14, 6500);
-        sheet.setColumnWidth(15, 6500);
-        sheet.setColumnWidth(16, 6000);
-        sheet.setColumnWidth(17, 8000);
-    }
+  return (
+    <Box sx={{ width: "100%", maxWidth: "420px", mx: "auto" }}>
+      {/* Information Header */}
+      <Box
+        sx={{
+          mb: 3,
+          p: { xs: 1.5, sm: 2 },
+          borderRadius: 2,
+          bgcolor: "rgba(0,0,0,0.03)",
+          border: "1px solid rgba(0,0,0,0.06)",
+        }}
+      >
+        <Box
+          sx={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 1.5,
+          }}
+        >
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{ fontWeight: 500, fontSize: { xs: "0.8rem", sm: "0.875rem" } }}
+          >
+            {isExpired ? "Status" : "Security Code Sent To"}
+          </Typography>
 
-    /*
-     * =========================================
-     * DOWNLOAD SAVE
-     * =========================================
-     */
-    private void sendToMyDownloads(String userId, SearchCriteriaDTO dto, byte[] content) {
-        try {
-            String json = new ObjectMapper().writeValueAsString(dto);
-            String fileName = "GL_Enquiry_" + dto.getCgl() + ".xlsx";
-            int menuId = dto.getMenuId();
+          <Box
+            sx={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 0.5,
+              width: "76px",
+              py: 0.3,
+              px: 0.8,
+              borderRadius: 1.5,
+              bgcolor: isExpired
+                ? "error.50"
+                : expiresIn > 60
+                  ? "primary.50"
+                  : "warning.50",
+              color: isExpired
+                ? "error.main"
+                : expiresIn > 60
+                  ? "primary.main"
+                  : "error.main",
+              border: "1px solid",
+              borderColor: isExpired
+                ? "error.100"
+                : expiresIn > 60
+                  ? "primary.100"
+                  : "warning.100",
+            }}
+          >
+            <AccessTimeIcon sx={{ fontSize: 14 }} />
+            <Typography
+              component="span"
+              sx={{
+                fontFamily: "monospace",
+                fontWeight: 700,
+                fontSize: "0.75rem",
+                width: "36px",
+                textAlign: "center",
+              }}
+            >
+              {formatTime(expiresIn)}
+            </Typography>
+          </Box>
+        </Box>
 
-            if (!(menuId == 50 || menuId == 51)) {
-                menuId = 51;
-            }
-            MyDownloadsRequestDTO request = new MyDownloadsRequestDTO(userId, fileName, menuId, json, content);
-            myDownloadsService.insertRequest(request);
-        } catch (JsonProcessingException e) {
-            // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-            log.error("Failed to serialize download request due to JSON processing error.");
+        {!isExpired && (
+          <Stack spacing={0.75}>
+            {otpData?.maskedMobile && (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1.25 }}>
+                <PhoneAndroidIcon
+                  sx={{ fontSize: 18, color: "text.secondary" }}
+                />
+                <Typography
+                  variant="subtitle2"
+                  color="text.primary"
+                  sx={{ fontSize: { xs: "0.8rem", sm: "0.875rem" } }}
+                >
+                  {otpData.maskedMobile}
+                </Typography>
+              </Box>
+            )}
 
-        } catch (DataAccessException e) {
-            // FIX: Removed 'e' from log to prevent stack trace logging (System Info Leak)
-            log.error("Failed to save download request due to a database error.");
-        }
-    }
+            {otpData?.maskedEmail && (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1.25 }}>
+                <EmailIcon sx={{ fontSize: 18, color: "text.secondary" }} />
+                <Typography
+                  variant="subtitle2"
+                  color="text.primary"
+                  sx={{
+                    fontSize: { xs: "0.8rem", sm: "0.875rem" },
+                    wordBreak: "break-all",
+                  }}
+                >
+                  {otpData.maskedEmail}
+                </Typography>
+              </Box>
+            )}
+          </Stack>
+        )}
 
-    /*
-     * =========================================
-     * SAFE STRING
-     * =========================================
-     */
-    private String safeString(Object value) {
+        {isExpired && (
+          <Typography
+            variant="body2"
+            color="error.main"
+            sx={{
+              fontWeight: 600,
+              fontSize: { xs: "0.825rem", sm: "0.875rem" },
+            }}
+          >
+            {isSessionUnauthorized
+              ? "Your validation session has expired."
+              : "Your verification token has timed out."}
+          </Typography>
+        )}
+      </Box>
 
-        return value != null ? value.toString() : "";
-    }
-}
+      {/* STATE 1: Active Entry */}
+      {!isExpired ? (
+        <>
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: "repeat(6, 1fr)",
+              gap: { xs: 0.75, sm: 1.25 },
+              mb: 3,
+            }}
+          >
+            {otpValues.map((val, idx) => (
+              <Box
+                key={idx}
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: 2,
+                  bgcolor: "background.paper",
+                  border: "1.5px solid",
+                  borderColor: val ? "primary.main" : "rgba(0, 0, 0, 0.15)",
+                  boxShadow: val
+                    ? "0 0 0 3px rgba(25, 118, 210, 0.12)"
+                    : "none",
+                  transition: "all 0.15s ease-in-out",
+                  height: { xs: 48, sm: 54, md: 58 },
+                  "&:focus-within": {
+                    borderColor: "primary.main",
+                    boxShadow: "0 0 0 3px rgba(25, 118, 210, 0.2)",
+                  },
+                }}
+              >
+                <InputBase
+                  inputRef={(el) => (inputRefs.current[idx] = el)}
+                  value={val}
+                  onChange={(e) => handleChange(idx, e)}
+                  onKeyDown={(e) => handleKeyDown(idx, e)}
+                  onPaste={handlePaste}
+                  disabled={isLoading}
+                  inputProps={{
+                    maxLength: 1,
+                    inputMode: "numeric",
+                    pattern: "[0-9]*",
+                    style: {
+                      textAlign: "center",
+                      fontSize: "1.25rem",
+                      fontWeight: 700,
+                      padding: 0,
+                      width: "100%",
+                      height: "100%",
+                    },
+                  }}
+                />
+              </Box>
+            ))}
+          </Box>
 
+          <PrimaryButton
+            fullWidth
+            variant="contained"
+            onClick={handleVerifyOTP}
+            disabled={isLoading || otpString.length !== 6}
+            sx={{ py: 1.25, fontSize: "0.95rem" }}
+          >
+            {isLoading ? (
+              <CircularProgress size={22} color="inherit" />
+            ) : (
+              "Verify OTP & Sign In"
+            )}
+          </PrimaryButton>
+
+          <Box
+            sx={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              mt: 2.5,
+            }}
+          >
+            <Button
+              startIcon={<ArrowBackIcon />}
+              onClick={onBackToHome}
+              sx={{
+                textTransform: "none",
+                color: "text.secondary",
+                fontSize: { xs: "0.75rem", sm: "0.85rem" },
+                p: 0.5,
+              }}
+              size="small"
+            >
+              Back To Sign In
+            </Button>
+
+            {!isExhausted && (
+              <Button
+                onClick={handleResendClick}
+                disabled={cooldown > 0 || isLoading}
+                loading={isLoading}
+                startIcon={<RefreshIcon />}
+                size="small"
+                sx={{
+                  fontWeight: 600,
+                  px: 1.5, // Consistent padding
+                  py: 0.5,
+                  minWidth: 100, // Prevent layout shift
+                }}
+              >
+                {cooldown ? `Resend in ${cooldown}s` : "Resend Code"}
+              </Button>
+            )}
+          </Box>
+        </>
+      ) : (
+        /* STATE 2: Expired Clean View */
+        <Box
+          sx={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            textAlign: "center",
+            py: 2,
+            px: 1,
+          }}
+        >
+          <Box
+            sx={{
+              width: 56,
+              height: 56,
+              borderRadius: "50%",
+              bgcolor: "error.50",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "error.main",
+              mb: 2,
+            }}
+          >
+            <WarningAmberIcon sx={{ fontSize: 32 }} />
+          </Box>
+
+          <Typography variant="h6" fontWeight={700} gutterBottom>
+            Session Expired
+          </Typography>
+
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{ mb: 3, maxWidth: "320px", lineHeight: 1.5 }}
+          >
+            {isSessionUnauthorized
+              ? "Your authentication session is no longer active. Please return to the login screen."
+              : "The OTP validity period has expired for security reasons. Please return to the login page to authenticate again."}
+          </Typography>
+
+          <PrimaryButton
+            fullWidth
+            variant="contained"
+            startIcon={<ArrowBackIcon />}
+            onClick={onBackToHome}
+            sx={{ py: 1.25 }}
+          >
+            Back to User ID
+          </PrimaryButton>
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+export default LoginWithOTP;
+
+
+import React from "react";
+import {
+  Dialog,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  IconButton,
+  Typography,
+  Box,
+  Fade,
+} from "@mui/material";
+import CloseSharpIcon from "@mui/icons-material/CloseSharp";
+import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
+import LockIcon from "@mui/icons-material/Lock";
+import BlockIcon from "@mui/icons-material/Block";
+import SecurityIcon from "@mui/icons-material/Security";
+import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import DoNotDisturbIcon from "@mui/icons-material/DoNotDisturb";
+
+// Normalized keys to match standard camelCase convention
+const iconMap = {
+  invalid: { icon: <SecurityIcon />, color: "error.main" },
+  error: { icon: <ErrorOutlineIcon />, color: "error.main" },
+  locked: { icon: <LockIcon />, color: "error.main" },
+  restricted: { icon: <BlockIcon />, color: "warning.main" },
+  rateLimit: { icon: <AccessTimeIcon />, color: "warning.main" },
+  denied: { icon: <DoNotDisturbIcon />, color: "error.main" },
+  warning: { icon: <WarningAmberIcon />, color: "warning.main" },
+};
+
+// Added smooth fade transition
+const Transition = React.forwardRef(function Transition(props, ref) {
+  return <Fade ref={ref} {...props} />;
+});
+
+const LoginErrorDialog = ({
+  showErrorDialog,
+  onDialogClose,
+  title,
+  content,
+  type = "error",
+}) => {
+  // Safety fallback if an unknown type is passed
+  const { icon, color } = iconMap[type] || iconMap.error;
+
+  return (
+    <Dialog
+      open={showErrorDialog}
+      fullWidth
+      maxWidth="sm"
+      onClose={onDialogClose}
+      TransitionComponent={Transition}
+      aria-labelledby="login-error-dialog-title"
+      aria-describedby="login-error-dialog-description"
+      sx={{
+        backdropFilter: "blur(4px)",
+        "& .MuiDialog-paper": { borderRadius: 2 },
+      }}
+    >
+      <DialogTitle
+        id="login-error-dialog-title"
+        sx={{
+          backgroundColor: color,
+          color: "white",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: 2,
+        }}
+      >
+        <Box display="flex" alignItems="center">
+          {React.cloneElement(icon, {
+            sx: { mr: 1.5, fontSize: "1.75rem" },
+            "aria-hidden": true,
+          })}
+          <Typography
+            variant="h6"
+            component="span"
+            sx={{ fontWeight: 600, fontSize: "1.1rem" }}
+          >
+            {title || "Error"}
+          </Typography>
+        </Box>
+        <IconButton
+          onClick={onDialogClose}
+          sx={{ color: "white" }}
+          aria-label="close dialog"
+        >
+          <CloseSharpIcon />
+        </IconButton>
+      </DialogTitle>
+
+      <DialogContent sx={{ padding: 3, pt: "24px !important" }}>
+        <DialogContentText
+          id="login-error-dialog-description"
+          sx={{ color: "text.primary" }}
+        >
+          <Typography variant="body1">{content}</Typography>
+        </DialogContentText>
+      </DialogContent>
+    </Dialog>
+  );
+};
+
+export default LoginErrorDialog;
