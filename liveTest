@@ -12,6 +12,8 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import EmailIcon from "@mui/icons-material/Email";
 import PhoneAndroidIcon from "@mui/icons-material/PhoneAndroid";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import PersonIcon from "@mui/icons-material/Person";
 import api from "../../../config/axiosConfig";
 import { resolveConfig } from "../../../config/EnvironmentConfig";
 import { PrimaryButton } from "./LoginStyles";
@@ -27,24 +29,45 @@ const LoginWithOTP = ({
   const inputRefs = useRef([]);
   const idleTimer = useRef(null);
 
-  const config = otpData.otpConfig;
-  const otpLength = config?.otpLength || 6;
+  const config = otpData?.otpConfig || {};
+  const otpLength = Number(config.otpLength ?? 6);
+  const inactivitySeconds = Number(config.inactivityTimeoutSeconds ?? 900);
 
   const [otpValues, setOtpValues] = useState(() => Array(otpLength).fill(""));
-  const [transactionId, setTransactionId] = useState(otpData.transactionId);
-  const [expiresIn, setExpiresIn] = useState(
-    otpData.expiresInSeconds ?? config?.expirySeconds ?? 5000,
+  const [transactionId, setTransactionId] = useState(
+    otpData?.transactionId || "",
   );
-  const [cooldown, setCooldown] = useState(otpData.resendCooldownSeconds);
-  const [resendsLeft, setResendsLeft] = useState(otpData.resendsRemaining);
+  const [expiresIn, setExpiresIn] = useState(
+    otpData?.expiresInSeconds ?? config.expirySeconds ?? 300,
+  );
+  const [cooldown, setCooldown] = useState(
+    otpData?.resendCooldownSeconds ?? config.resendCooldownSeconds ?? 60,
+  );
+  const [resendsLeft, setResendsLeft] = useState(
+    otpData?.resendsRemaining ?? config.maxResends ?? 3,
+  );
+  const [sessionRemaining, setSessionRemaining] = useState(inactivitySeconds);
 
   const [isLoading, setIsLoading] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
-  const [isExpired, setIsExpired] = useState(false);
+  const [isOtpExpired, setIsOtpExpired] = useState(false);
+  const [isSessionExpired, setIsSessionExpired] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
 
   const otp = otpValues.join("");
   const isOtpComplete = otp.length === otpLength;
+  const isExpired = isOtpExpired || expiresIn <= 0;
+
+  // Format seconds as MM:SS
+  const formatTime = (seconds) => {
+    const minutes = Math.floor(seconds / 60)
+      .toString()
+      .padStart(2, "0");
+
+    const remainingSeconds = (seconds % 60).toString().padStart(2, "0");
+
+    return `${minutes}:${remainingSeconds}`;
+  };
 
   // Focus first input
   const focusFirstInput = () => {
@@ -57,27 +80,26 @@ const LoginWithOTP = ({
     focusFirstInput();
   };
 
-  // Expire transaction/session
+  // Handle actual session expiration
   const expireSession = (message) => {
     setErrorMessage(
       message || "Your session has timed out. Please log in again.",
     );
-    setIsExpired(true);
+    setIsSessionExpired(true);
     setOtpValues(Array(otpLength).fill(""));
     clearTimeout(idleTimer.current);
   };
 
-  // 15-minute inactivity timeout
+  // Reset inactivity timer whenever the user interacts
   useEffect(() => {
     const resetIdleTimer = () => {
       clearTimeout(idleTimer.current);
 
-      idleTimer.current = setTimeout(
-        () => {
-          expireSession("Your session has timed out. Please log in again.");
-        },
-        config?.inactivityTimeoutSeconds || 15 * 1000,
-      );
+      setSessionRemaining(inactivitySeconds);
+
+      idleTimer.current = setTimeout(() => {
+        expireSession("Your session has timed out. Please log in again.");
+      }, inactivitySeconds * 1000);
     };
 
     const events = ["mousedown", "keydown", "touchstart", "scroll", "click"];
@@ -88,28 +110,32 @@ const LoginWithOTP = ({
 
     return () => {
       clearTimeout(idleTimer.current);
+
       events.forEach((event) =>
         window.removeEventListener(event, resetIdleTimer),
       );
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config?.inactivityTimeoutSeconds]);
+  }, [inactivitySeconds]);
 
-  // OTP expiry and resend cooldown
+  // OTP expiry, resend cooldown and session display timer
   useEffect(() => {
     const timer = setInterval(() => {
       setExpiresIn((prev) => {
         if (prev <= 1) {
-          setIsExpired(true);
+          setIsOtpExpired(true);
           setErrorMessage(
             "The code is invalid or has expired. Please request a new code.",
           );
           return 0;
         }
+
         return prev - 1;
       });
 
       setCooldown((prev) => Math.max(0, prev - 1));
+
+      setSessionRemaining((prev) => Math.max(0, prev - 1));
     }, 1000);
 
     return () => clearInterval(timer);
@@ -117,32 +143,52 @@ const LoginWithOTP = ({
 
   // Initial focus
   useEffect(() => {
-    if (!isExpired) focusFirstInput();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    focusFirstInput();
   }, []);
 
   // Update values from backend
   const updateOtpData = (data) => {
-    if (data?.transactionId) {
+    if (!data) return;
+
+    if (data.transactionId) {
       setTransactionId(data.transactionId);
     }
 
-    if (data?.expiresInSeconds !== undefined) {
+    if (data.expiresInSeconds !== undefined) {
       setExpiresIn(data.expiresInSeconds);
+      setIsOtpExpired(data.expiresInSeconds <= 0);
     }
 
-    if (data?.resendCooldownSeconds !== undefined) {
+    if (data.resendCooldownSeconds !== undefined) {
       setCooldown(data.resendCooldownSeconds);
     }
 
-    if (data?.resendsRemaining !== undefined) {
+    if (data.resendsRemaining !== undefined) {
       setResendsLeft(data.resendsRemaining);
     }
   };
 
+  // Check whether backend has expired the complete session
+  const handleBackendSessionError = (err) => {
+    const data = err.response?.data?.data || {};
+    const message = err.response?.data?.message || "";
+
+    if (
+      data.sessionExpired === true ||
+      message.toLowerCase().includes("session has timed out") ||
+      message.toLowerCase().includes("session timed out")
+    ) {
+      expireSession(message);
+      return true;
+    }
+
+    return false;
+  };
+
   // Resend OTP
   const handleResendOTP = async () => {
-    if (isLoading || cooldown > 0 || resendsLeft <= 0 || isExpired) {
+    if (isLoading || cooldown > 0 || resendsLeft <= 0 || isSessionExpired) {
+      showSnackbar("warning test", "warning");
       return;
     }
 
@@ -152,34 +198,37 @@ const LoginWithOTP = ({
     try {
       const response = await api.post(
         `${resolveConfig("/LS") || ""}/auth/resend-otp`,
-        {
-          userId,
-          transactionId,
-        },
+        { transactionId },
       );
 
       const data = response?.data?.data || {};
 
       updateOtpData(data);
-      setExpiresIn(data.expiresInSeconds ?? config?.expirySeconds);
+
+      setExpiresIn(data.expiresInSeconds ?? config.expirySeconds ?? 300);
+
+      setIsOtpExpired(false);
       setIsLocked(false);
+      setErrorMessage("");
+
       clearOtp();
 
       showSnackbar(response?.data?.message || data.message, "success");
     } catch (err) {
-      const message = err.response?.data?.message || "";
+      if (!handleBackendSessionError(err)) {
+        const data = err.response?.data?.data || {};
 
-      if (
-        err.response?.status === 401 &&
-        message.toLowerCase().includes("session")
-      ) {
-        expireSession(message);
-      } else {
-        setErrorMessage(message);
+        updateOtpData(data);
+
+        if (data.otpExpired === true) {
+          setIsOtpExpired(true);
+        }
+
+        setErrorMessage(
+          err.response?.data?.message ||
+            "Unable to resend OTP. Please try again.",
+        );
       }
-
-      // Update cooldown/resend count if supplied by backend
-      updateOtpData(err.response?.data?.data);
     } finally {
       setIsLoading(false);
     }
@@ -187,7 +236,13 @@ const LoginWithOTP = ({
 
   // Verify OTP
   const handleVerifyOTP = async () => {
-    if (isLoading || !isOtpComplete || isLocked || isExpired) {
+    if (
+      isLoading ||
+      !isOtpComplete ||
+      isLocked ||
+      isExpired ||
+      isSessionExpired
+    ) {
       return;
     }
 
@@ -218,23 +273,31 @@ const LoginWithOTP = ({
     } catch (err) {
       const status = err.response?.status;
       const message = err.response?.data?.message || "";
-      const backendData = err.response?.data?.data;
+      const backendData = err.response?.data?.data || {};
+
+      if (handleBackendSessionError(err)) {
+        return;
+      }
 
       if (status === 401) {
-        if (message.toLowerCase().includes("session")) {
-          expireSession(message);
-        } else if (
+        if (
           message.toLowerCase().includes("too many incorrect attempts") ||
-          backendData?.attemptsRemaining === 0
+          backendData.attemptsRemaining === 0
         ) {
-          // Stay on OTP screen and allow resend
+          // Fifth failed attempt: stay on OTP screen and allow resend
           setIsLocked(true);
           setErrorMessage(message);
-          clearOtp();
-        } else if (message.toLowerCase().includes("expired")) {
-          expireSession(message);
+          setOtpValues(Array(otpLength).fill(""));
+        } else if (
+          backendData.otpExpired === true ||
+          message.toLowerCase().includes("invalid or has expired")
+        ) {
+          // OTP expired, but transaction/session may still be active
+          setIsOtpExpired(true);
+          setErrorMessage(message);
+          setOtpValues(Array(otpLength).fill(""));
         } else {
-          // Incorrect OTP: clear and refocus
+          // Incorrect OTP
           setErrorMessage(message);
           clearOtp();
         }
@@ -249,7 +312,7 @@ const LoginWithOTP = ({
     }
   };
 
-  // OTP input changes
+  // OTP input handling
   const handleChange = (index, event) => {
     const digits = event.target.value.replace(/\D/g, "");
 
@@ -321,8 +384,8 @@ const LoginWithOTP = ({
 
   return (
     <Box sx={{ width: "100%", maxWidth: "420px", mx: "auto" }}>
-      {isExpired ? (
-        // Expired transaction/session screen
+      {/* Session expired screen */}
+      {isSessionExpired ? (
         <Box
           sx={{
             display: "flex",
@@ -361,7 +424,7 @@ const LoginWithOTP = ({
         </Box>
       ) : (
         <>
-          {/* Header */}
+          {/* OTP information */}
           <Box
             sx={{
               mb: 3,
@@ -376,29 +439,91 @@ const LoginWithOTP = ({
             </Typography>
 
             <Stack spacing={0.75}>
-              {otpData.maskedMobile && (
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1.25 }}>
+              {userId && (
+                <Box
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1.25,
+                  }}
+                >
+                  <PersonIcon sx={{ fontSize: 18, color: "text.secondary" }} />
+                  <Typography variant="subtitle2">{userId}</Typography>
+                </Box>
+              )}
+
+              {otpData?.maskedMobile && (
+                <Box
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1.25,
+                  }}
+                >
                   <PhoneAndroidIcon
                     sx={{ fontSize: 18, color: "text.secondary" }}
                   />
                   <Typography variant="subtitle2">
-                    {otpData.maskedMobile}
+                    {otpData.maskedMobile?.toString()}
                   </Typography>
                 </Box>
               )}
 
-              {otpData.maskedEmail && (
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1.25 }}>
+              {otpData?.maskedEmail && (
+                <Box
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1.25,
+                  }}
+                >
                   <EmailIcon sx={{ fontSize: 18, color: "text.secondary" }} />
                   <Typography
                     variant="subtitle2"
                     sx={{ wordBreak: "break-all" }}
                   >
-                    {otpData.maskedEmail}
+                    {otpData.maskedEmail?.toString()}
                   </Typography>
                 </Box>
               )}
             </Stack>
+
+            {/* Temporary timer display for debugging */}
+            {/* <Box
+              sx={{
+                mt: 2,
+                p: 1.5,
+                borderRadius: 1.5,
+                bgcolor: "rgba(25,118,210,0.06)",
+              }}
+            >
+              <Typography
+                variant="caption"
+                display="block"
+                sx={{ fontWeight: 600, mb: 0.5 }}
+              >
+                <AccessTimeIcon
+                  sx={{
+                    fontSize: 13,
+                    verticalAlign: "middle",
+                    mr: 0.5,
+                  }}
+                />
+                Temporary timer diagnostics
+              </Typography>
+
+              <Typography variant="caption" display="block">
+                Session inactivity: {formatTime(sessionRemaining)}
+              </Typography>
+
+              <Typography variant="caption" display="block">
+                OTP validity: {formatTime(expiresIn)}
+              </Typography>
+
+              <Typography variant="caption" display="block">
+                Resend cooldown: {formatTime(cooldown)}
+              </Typography>
+            </Box> */}
           </Box>
 
           {/* OTP inputs */}
@@ -436,7 +561,7 @@ const LoginWithOTP = ({
                   onChange={(event) => handleChange(index, event)}
                   onKeyDown={(event) => handleKeyDown(index, event)}
                   onPaste={handlePaste}
-                  disabled={isLoading || isLocked}
+                  disabled={isLoading || isLocked || isExpired}
                   inputProps={{
                     maxLength: otpLength,
                     inputMode: "numeric",
@@ -457,7 +582,7 @@ const LoginWithOTP = ({
           {/* Fixed-height error area prevents card movement */}
           <Box
             sx={{
-              minHeight: 48,
+              // minHeight: 48,
               display: "flex",
               alignItems: "flex-start",
               justifyContent: "center",
@@ -479,7 +604,7 @@ const LoginWithOTP = ({
             fullWidth
             variant="contained"
             onClick={handleVerifyOTP}
-            disabled={isLoading || !isOtpComplete || isLocked}
+            disabled={isLoading || !isOtpComplete || isLocked || isExpired}
             sx={{ py: 1.25, fontSize: "0.95rem" }}
           >
             {isLoading ? (
@@ -489,6 +614,7 @@ const LoginWithOTP = ({
             )}
           </PrimaryButton>
 
+          {/* Navigation and resend */}
           <Box
             sx={{
               display: "flex",
@@ -513,7 +639,7 @@ const LoginWithOTP = ({
 
             <Button
               onClick={handleResendOTP}
-              disabled={isLoading || cooldown > 0 || resendsLeft <= 0}
+              // disabled={isLoading || cooldown > 0 || resendsLeft <= 0}
               startIcon={<RefreshIcon />}
               size="small"
               sx={{ fontWeight: 600, px: 1.5 }}
@@ -521,6 +647,14 @@ const LoginWithOTP = ({
               {cooldown > 0 ? `Resend in ${cooldown}s` : "Resend OTP"}
             </Button>
           </Box>
+
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", textAlign: "right", mt: 1 }}
+          >
+            {resendsLeft} resend(s) remaining
+          </Typography>
         </>
       )}
     </Box>
